@@ -1,0 +1,3 @@
+# Protected patterns a task may open: list the exact pattern in the task's opened file (HUTCH_OPENED=<file> hutch new).
+# Typical candidates: migrations, generated code, interface contracts, decision records. A pattern that is not also in
+# protected has no effect here.

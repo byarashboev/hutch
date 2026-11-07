@@ -1,0 +1,4 @@
+# Sensitive paths that need a strong model (HUTCH_KIND=design or concurrency): money, authorization, concurrency,
+# migrations. Bash globs, one per line. A task needs a strong model when an allow pattern and a line here match in
+# either direction, or when it opens protected paths. List concrete example files as well as globs, so that a broad
+# allow pattern such as src/* is caught. Leave this file without patterns to turn the rule off.

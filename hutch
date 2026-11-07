@@ -1,0 +1,609 @@
+#!/usr/bin/env bash
+# hutch: a coding agent (opencode or Claude Code) does one bounded task in an isolated container; the host agent briefs and verifies.
+#   hutch status                     machine and project state; start here (exit 3: project not set up, 4: machine not set up)
+#   hutch init [--in-repo]           create this project's config from the template (~/.hutch/projects/<name>, or <repo>/.hutch)
+#   hutch build                      build the base, proxy and project images and create the networks
+#   hutch new <task> <allow> <brief> clone the base branch (or $HUTCH_BRANCH) into a task workspace
+#   hutch run <task>                 run the agent on the primer and brief (log in the task's out directory)
+#   hutch say <task> <message>       follow-up message (opencode: after the run ends; claude: during the run)
+#   hutch shell <task>               interactive agent session in the sandbox
+#   hutch export <task>              write the task branch as a git bundle
+#   hutch verify <task>              fetch the bundle on the host, check paths, run the project's checks offline
+#   hutch rm <task>                  remove a task workspace, its output and its ref
+#   hutch smoke|isolation <task>     one-line model call | egress, mount and capability probes
+#   hutch models                     the model chosen per HUTCH_KIND and the skipped models
+#   hutch needs-pro <task>           why a task needs a strong model (exit 1: it does not)
+# Agents: read AGENTS.md next to this script before using it.
+# Path rules match unquoted globs on purpose (SC2053); the isolation probe is a literal script (SC2016).
+# shellcheck disable=SC2053,SC2016,SC2012
+set -euo pipefail
+
+HUTCH_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+HUTCH_HOME="${HUTCH_HOME:-${HOME}/.hutch}"
+BASE_IMAGE=hutch-base:latest
+PROXY_IMAGE=hutch-proxy:latest
+NET_INTERNAL=hutch-internal
+NET_EGRESS=hutch-egress
+PROXY=hutch-proxy
+# Kinds in the model tables that count as strong models for the pro-paths rule.
+PRO_KINDS="design concurrency"
+
+die() { echo "hutch: $*" >&2; exit 1; }
+
+# ---- provider, agent and model -------------------------------------------------------------------------------
+
+setup_provider() {
+  PROVIDER="${HUTCH_PROVIDER:-opencode}"
+  case "$PROVIDER" in
+    opencode)
+      BASE_URL=https://opencode.ai/inference/go/anthropic  # OpenCode Go's Anthropic-format endpoint (Claude Code agent)
+      KEY_ITEM="${HUTCH_KEY_ITEM:-opencode-go}"
+      COMPACT_WINDOW="${HUTCH_COMPACT_WINDOW:-}" ;;
+    deepseek)
+      BASE_URL=https://api.deepseek.com/anthropic
+      KEY_ITEM="${HUTCH_KEY_ITEM:-deepseek-api}"
+      COMPACT_WINDOW="${HUTCH_COMPACT_WINDOW:-786432}" ;;
+    *) die "HUTCH_PROVIDER must be opencode or deepseek" ;;
+  esac
+  MODELS_FILE="${HUTCH_MODELS:-${HUTCH_DIR}/models/${PROVIDER}.tsv}"
+  AGENT="${HUTCH_AGENT:-opencode}"
+  case "$AGENT" in
+    opencode) [[ "$PROVIDER" == opencode ]] || die "HUTCH_AGENT=opencode runs only on HUTCH_PROVIDER=opencode" ;;
+    claude) ;;
+    *) die "HUTCH_AGENT must be opencode or claude" ;;
+  esac
+  KIND="${HUTCH_KIND:-}"
+  [[ -z "$KIND" && "${HUTCH_PHASE:-}" == design ]] && KIND=design
+  MODEL="${HUTCH_MODEL:-}"
+  SMALL_MODEL="${HUTCH_SMALL_MODEL:-}"
+}
+
+# kinds lists the HUTCH_KIND values the model table defines.
+kinds() { awk -F'\t' '!/^#/ && NF > 1 && $1 != "small" { printf "%s%s", sep, $1; sep = ", " }' "$MODELS_FILE"; }
+
+# pick_model prints the first model of a table row that ~/.hutch/skip does not list (one model per line there).
+pick_model() {
+  local row m
+  row="$(awk -F'\t' -v k="$1" '$1 == k { print $2 }' "$MODELS_FILE")"
+  [[ -n "$row" ]] || die "$(basename "$MODELS_FILE") has no kind '$1' ($(kinds))"
+  for m in $row; do
+    grep -qxF "$m" "${HUTCH_HOME}/skip" 2>/dev/null || { echo "$m"; return; }
+  done
+  die "every model for '$1' is in ${HUTCH_HOME}/skip"
+}
+
+# need_models resolves MODEL and SMALL_MODEL for a command that talks to a model.
+need_models() {
+  if [[ -z "$MODEL" ]]; then
+    [[ -n "$KIND" ]] || die "set HUTCH_KIND ($(kinds)) or HUTCH_MODEL"
+    MODEL="$(pick_model "$KIND")"
+  fi
+  [[ -n "$SMALL_MODEL" ]] || SMALL_MODEL="$(pick_model small)"
+}
+
+# api_key prints the provider key: HUTCH_API_KEY, else the macOS keychain, else the Secret Service (Linux).
+api_key() {
+  if [[ -n "${HUTCH_API_KEY:-}" ]]; then echo "$HUTCH_API_KEY"; return; fi
+  if command -v security >/dev/null; then
+    security find-generic-password -s "$KEY_ITEM" -w 2>/dev/null && return
+  elif command -v secret-tool >/dev/null; then
+    secret-tool lookup service "$KEY_ITEM" 2>/dev/null && return
+  fi
+  die "no API key: store it as '$KEY_ITEM' (AGENTS.md, Machine setup) or set HUTCH_API_KEY"
+}
+
+have_key() {
+  [[ -n "${HUTCH_API_KEY:-}" ]] && return 0
+  if command -v security >/dev/null; then security find-generic-password -s "$KEY_ITEM" >/dev/null 2>&1; return; fi
+  command -v secret-tool >/dev/null && [[ -n "$(secret-tool lookup service "$KEY_ITEM" 2>/dev/null)" ]]
+}
+
+# ---- project ---------------------------------------------------------------------------------------------------
+
+# conf_get prints the value of key $1 from the project config (key=value lines; the file is read, never executed).
+conf_get() {
+  awk -v k="$1" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$CONF/config"
+}
+
+slug() { echo "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-\n' '-'; }
+
+# resolve_project sets REPO (the main checkout, also from a worktree), NAME and CONF; CONF is empty when not set up.
+resolve_project() {
+  local common
+  CONF=""
+  if [[ -n "${HUTCH_PROJECT:-}" ]]; then
+    NAME="$(slug "$HUTCH_PROJECT")"
+    [[ -f "${HUTCH_HOME}/projects/${NAME}/config" ]] && CONF="${HUTCH_HOME}/projects/${NAME}"
+    REPO=""
+    [[ -n "$CONF" ]] && REPO="$(conf_get repo)"
+    [[ -n "$REPO" ]] || die "HUTCH_PROJECT=$NAME needs ${HUTCH_HOME}/projects/${NAME}/config with a repo= line"
+  else
+    common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
+      die "not inside a git repository (or set HUTCH_PROJECT)"
+    REPO="$(dirname "$common")"
+    NAME="$(slug "$(basename "$REPO")")"
+    if [[ -f "$REPO/.hutch/config" ]]; then CONF="$REPO/.hutch"
+    elif [[ -f "${HUTCH_HOME}/projects/${NAME}/config" ]]; then CONF="${HUTCH_HOME}/projects/${NAME}"; fi
+  fi
+  if [[ -n "$CONF" ]]; then
+    local n; n="$(conf_get name)"
+    [[ -n "$n" ]] && NAME="$n"
+    [[ "$NAME" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "project name '$NAME' must match [a-z0-9][a-z0-9-]*"
+  fi
+  STATE="${HUTCH_HOME}/state/${NAME}"
+  PROJECT_IMAGE="hutch-${NAME}:latest"
+  CACHE_VOLUME="hutch-${NAME}-cache"
+  CLAUDE_VOLUME="hutch-${NAME}-claude"
+}
+
+# try_resolve resolves the project when that works and fails quietly otherwise (resolve_project exits on errors).
+try_resolve() { (resolve_project) >/dev/null 2>&1 && resolve_project; }
+
+need_project() {
+  resolve_project
+  [[ -n "$CONF" ]] && return
+  echo "hutch: project '$NAME' ($REPO) is not set up: there is no $REPO/.hutch/config or ${HUTCH_HOME}/projects/$NAME/config." >&2
+  echo "Agents: stop here and follow \"Project setup\" in ${HUTCH_DIR}/AGENTS.md, asking the user its questions, before any other hutch command." >&2
+  exit 3
+}
+
+base_branch() { local b; b="$(conf_get base_branch)"; echo "${b:-main}"; }
+
+task_dir() { echo "${STATE}/work/$1"; }
+out_dir() { echo "${STATE}/out/$1"; }
+
+need_task() {
+  [[ -n "${1:-}" && "$1" =~ ^[a-z0-9-]+$ ]] || die "task name must match [a-z0-9-]+"
+  [[ -d "$(task_dir "$1")/repo" ]] || die "no workspace for $1 (hutch new)"
+}
+
+# patterns prints the non-comment lines of a pattern file; a missing file prints nothing.
+patterns() { [[ -f "$1" ]] || return 0; grep -v -e '^[[:space:]]*$' -e '^#' "$1" || true; }
+
+# ---- path rules ------------------------------------------------------------------------------------------------
+
+# Paths the agent may never change, whatever the project or task says: the project's hutch config itself.
+ALWAYS_PROTECTED='.hutch/*'
+
+# opened succeeds when protected pattern $1 is openable in this project and the task's opened file lists it.
+opened() {
+  local p="$1" o
+  [[ -f "$OPENED_FILE" ]] || return 1
+  grep -qxF -- "$p" "$OPENED_FILE" || return 1
+  while IFS= read -r o; do [[ "$p" == "$o" ]] && return 0; done < <(patterns "$CONF/openable")
+  return 1
+}
+
+protected() {
+  local f="$1" p
+  [[ "$f" == $ALWAYS_PROTECTED ]] && return 0
+  while IFS= read -r p; do
+    [[ "$f" == $p ]] && ! opened "$p" && return 0
+  done < <(patterns "$CONF/protected")
+  return 1
+}
+
+allowed() {
+  local f="$1" p
+  while IFS= read -r p; do [[ "$f" == $p ]] && return 0; done < <(patterns "$ALLOW_FILE")
+  return 1
+}
+
+# needs_pro prints why a task (allow file $1, opened file $2) needs a strong model and succeeds. The rule is on only
+# when the project has a pro-paths file. An allow pattern needs one when it and a pro-paths line match either way, so
+# both a narrow allow inside a sensitive area and a broad allow that covers one are caught.
+needs_pro() {
+  local allow="$1" opened_file="$2" p g
+  [[ -n "$(patterns "$CONF/pro-paths")" ]] || return 1
+  [[ -s "$opened_file" ]] && { echo "opens protected paths ($(tr '\n' ' ' <"$opened_file"))"; return 0; }
+  while IFS= read -r p; do
+    while IFS= read -r g; do
+      if [[ "$p" == $g || "$g" == $p ]]; then echo "may change sensitive code ($p, pro-paths: $g)"; return 0; fi
+    done < <(patterns "$CONF/pro-paths")
+  done < <(patterns "$allow")
+  return 1
+}
+
+need_pro_kind() {
+  local dir reason k pro=" "
+  dir="$(task_dir "$1")"
+  reason="$(needs_pro "$dir/allow" "$dir/opened")" || return 0
+  for k in $PRO_KINDS; do pro+="$(awk -F'\t' -v k="$k" '$1 == k { print $2 }' "$MODELS_FILE") "; done
+  [[ "$pro" == *" $MODEL "* ]] && return 0
+  die "task $1 $reason; run it with HUTCH_KIND set to one of: $PRO_KINDS (a strong model)"
+}
+
+# ---- runtime (Docker) ------------------------------------------------------------------------------------------
+
+need_docker() { docker info >/dev/null 2>&1 || die "docker is not running"; }
+
+need_image() { docker image inspect "$1" >/dev/null 2>&1 || die "image $1 is missing; run hutch build"; }
+
+proxy_up() {
+  if [[ "$(docker inspect -f '{{.State.Running}}' "$PROXY" 2>/dev/null)" == true ]]; then return; fi
+  docker rm -f "$PROXY" >/dev/null 2>&1 || true
+  docker run -d --name "$PROXY" --network "$NET_EGRESS" --cap-drop ALL \
+    --security-opt no-new-privileges --restart unless-stopped "$PROXY_IMAGE" >/dev/null
+  docker network connect "$NET_INTERNAL" "$PROXY"
+}
+
+cache_args() {
+  local m; m="$(conf_get cache_mount)"
+  [[ -n "$m" ]] && echo "-v ${CACHE_VOLUME}:${m}"
+  return 0
+}
+
+# sandbox runs SANDBOX_CMD in the project image: internal network behind the allowlist proxy, no capabilities, only
+# the task's files mounted. Extra docker flags come in "$@".
+sandbox() {
+  local task="$1"; shift
+  local dir key agent_args extra
+  dir="$(task_dir "$task")"
+  [[ -f "$CONF/primer.md" ]] || die "missing $CONF/primer.md"
+  need_image "$PROJECT_IMAGE"
+  key="$(api_key)"
+  proxy_up
+  if [[ "$AGENT" == opencode ]]; then
+    # Sessions live with the task, so a follow-up (hutch say) continues the same session.
+    mkdir -p "$dir/oc-data"
+    agent_args=(-v "$dir/oc-data:/home/hutch/.local/share/opencode"
+      -v "${HUTCH_DIR}/opencode/opencode.json:/home/hutch/.config/opencode/opencode.json:ro"
+      -v "${HUTCH_DIR}/rules/sandbox.md:/home/hutch/.config/opencode/AGENTS.md:ro"
+      -e OPENCODE_API_KEY -e OC_MODEL="opencode-go/$MODEL" -e OC_SMALL_MODEL="opencode-go/$SMALL_MODEL")
+  else
+    agent_args=(-v "${CLAUDE_VOLUME}:/home/hutch/.claude" -v "${HUTCH_DIR}/rules/sandbox.md:/home/hutch/.claude/CLAUDE.md:ro"
+      -e ANTHROPIC_AUTH_TOKEN -e ANTHROPIC_BASE_URL="$BASE_URL"
+      -e ANTHROPIC_MODEL="$MODEL" -e ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL"
+      -e ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" -e ANTHROPIC_DEFAULT_HAIKU_MODEL="$SMALL_MODEL"
+      -e CLAUDE_CODE_SUBAGENT_MODEL="$SMALL_MODEL" -e CLAUDE_CODE_EFFORT_LEVEL="${HUTCH_EFFORT:-max}"
+      -e CLAUDE_CONFIG_DIR=/home/hutch/.claude)
+    [[ -n "$COMPACT_WINDOW" ]] && agent_args+=(-e CLAUDE_CODE_AUTO_COMPACT_WINDOW="$COMPACT_WINDOW")
+  fi
+  extra=()
+  [[ -f "$CONF/checklist.md" ]] && extra+=(-v "$CONF/checklist.md:/task/project-checklist.md:ro")
+  [[ -f "$CONF/protected" ]] && extra+=(-v "$CONF/protected:/task/protected.txt:ro")
+  [[ -f "$dir/opened" ]] && extra+=(-v "$dir/opened:/task/opened.txt:ro")
+  local pids mem
+  pids="${HUTCH_PIDS:-$(conf_get pids)}"; mem="${HUTCH_MEMORY:-$(conf_get memory)}"
+  # shellcheck disable=SC2046 # cache_args prints whole docker flags
+  ANTHROPIC_AUTH_TOKEN="$key" OPENCODE_API_KEY="$key" docker run --rm "$@" \
+    --network "$NET_INTERNAL" --cap-drop ALL --security-opt no-new-privileges \
+    --pids-limit "${pids:-2048}" --memory "${mem:-12g}" --tmpfs /tmp:exec,size=4g \
+    -v "$dir/repo:/work" -v "$dir/brief.md:/task/brief.md:ro" -v "$CONF/primer.md:/task/primer.md:ro" \
+    -v "${HUTCH_DIR}/rules/checklist.md:/task/checklist.md:ro" -v "$(out_dir "$task"):/out" \
+    ${extra[@]+"${extra[@]}"} $(cache_args) "${agent_args[@]}" -e HUTCH_PROBE_URL="$BASE_URL" \
+    -e HTTPS_PROXY="http://${PROXY}:8888" -e HTTP_PROXY="http://${PROXY}:8888" \
+    "$PROJECT_IMAGE" "${SANDBOX_CMD[@]}"
+}
+
+# offline runs a command in the project image with no network at all.
+offline() {
+  # shellcheck disable=SC2046
+  docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:exec,size=4g \
+    $(cache_args) "$@"
+}
+
+# ---- commands --------------------------------------------------------------------------------------------------
+
+line() { printf '  %-22s %s\n' "$1" "$2"; }
+
+cmd_status() {
+  local rc=0 ok
+  echo "hutch ${HUTCH_DIR} ($(git -C "$HUTCH_DIR" rev-parse --short HEAD 2>/dev/null || echo 'not a git checkout'))"
+  echo "machine:"
+  if docker info >/dev/null 2>&1; then line docker ok; else line docker "MISSING (start Docker)"; rc=4; fi
+  if have_key; then line "key $KEY_ITEM" ok; else line "key $KEY_ITEM" "MISSING (AGENTS.md, Machine setup)"; rc=4; fi
+  for ok in "$BASE_IMAGE" "$PROXY_IMAGE"; do
+    if docker image inspect "$ok" >/dev/null 2>&1; then line "$ok" ok; else line "$ok" "MISSING (hutch build)"; rc=4; fi
+  done
+  command -v hutch >/dev/null || echo "  hutch is not on PATH (optional: ln -s ${HUTCH_DIR}/hutch ~/.local/bin/hutch)"
+  echo "project:"
+  if ! try_resolve; then echo "  not inside a git repository (or HUTCH_PROJECT has no config)"; return "$rc"; fi
+  line name "$NAME"
+  line repo "$REPO"
+  if [[ -z "$CONF" ]]; then
+    line config "NOT SET UP (follow \"Project setup\" in ${HUTCH_DIR}/AGENTS.md)"
+    [[ $rc -eq 0 ]] && rc=3
+    return "$rc"
+  fi
+  line config "$CONF"
+  if docker image inspect "$PROJECT_IMAGE" >/dev/null 2>&1; then line image "$PROJECT_IMAGE ok"
+  else line image "$PROJECT_IMAGE MISSING (hutch build)"; [[ $rc -eq 0 ]] && rc=4; fi
+  line tasks "$(ls "${STATE}/work" 2>/dev/null | tr '\n' ' ')"
+  return "$rc"
+}
+
+cmd_init() {
+  local dest
+  resolve_project
+  [[ -z "$CONF" ]] || die "already set up: $CONF"
+  if [[ "${1:-}" == --in-repo ]]; then dest="$REPO/.hutch"; else dest="${HUTCH_HOME}/projects/${NAME}"; fi
+  [[ ! -e "$dest" ]] || die "$dest exists"
+  mkdir -p "$dest"
+  /bin/cp -R "${HUTCH_DIR}/template/." "$dest/"
+  { echo "name=$NAME"; [[ "$dest" == "$REPO/.hutch" ]] || echo "repo=$REPO"; } >>"$dest/config"
+  echo "created $dest; fill in every file there (AGENTS.md, Project setup), then run hutch build"
+}
+
+cmd_build() {
+  need_docker
+  docker build -t "$BASE_IMAGE" --build-arg HUTCH_UID="$(id -u)" --build-arg HUTCH_GID="$(id -g)" "${HUTCH_DIR}/image"
+  docker build -t "$PROXY_IMAGE" "${HUTCH_DIR}/proxy"
+  docker network inspect "$NET_INTERNAL" >/dev/null 2>&1 || docker network create --internal "$NET_INTERNAL" >/dev/null
+  docker network inspect "$NET_EGRESS" >/dev/null 2>&1 || docker network create "$NET_EGRESS" >/dev/null
+  CONF=""
+  try_resolve || true
+  if [[ -z "$CONF" ]]; then echo "base and proxy built; no project here is set up, so no project image"; return; fi
+  local re files branch
+  BUILD_CTX="$(mktemp -d)"
+  trap 'rm -rf "$BUILD_CTX"' EXIT
+  mkdir "$BUILD_CTX/src"
+  re="$(conf_get manifests)"
+  branch="$(base_branch)"
+  # Dependency manifests only, from the committed base branch: the image changes when dependencies do.
+  if [[ -n "$re" ]]; then
+    files="$(git -C "$REPO" ls-tree -r --name-only "$branch" | grep -E -- "$re" || true)"
+    [[ -n "$files" ]] || die "manifests=$re matches no file on $branch"
+    # shellcheck disable=SC2086 # one path per line, no spaces in manifest paths
+    git -C "$REPO" archive "$branch" -- $files | tar -x -C "$BUILD_CTX/src"
+  fi
+  /bin/cp -f "$CONF/Dockerfile" "$BUILD_CTX/Dockerfile"
+  docker build -t "$PROJECT_IMAGE" --build-arg HUTCH_BASE="$BASE_IMAGE" "$BUILD_CTX"
+}
+
+cmd_new() {
+  local task="$1" allow="$2" brief="$3" dir
+  [[ "$task" =~ ^[a-z0-9-]+$ ]] || die "task name must match [a-z0-9-]+"
+  [[ -f "$allow" && -f "$brief" ]] || die "allow and brief files must exist"
+  dir="$(task_dir "$task")"
+  [[ ! -e "$dir" ]] || die "$dir exists"
+  mkdir -p "$dir" "$(out_dir "$task")"
+  git clone --quiet --no-local --single-branch --branch "${HUTCH_BRANCH:-$(base_branch)}" "$REPO" "$dir/repo"
+  git -C "$dir/repo" remote remove origin
+  git -C "$dir/repo" switch --quiet -c "hutch/$task"
+  git -C "$dir/repo" config user.name "hutch agent"
+  git -C "$dir/repo" config user.email "hutch@localhost"
+  git -C "$dir/repo" rev-parse HEAD >"$dir/base"
+  /bin/cp -f "$allow" "$dir/allow"
+  /bin/cp -f "$brief" "$dir/brief.md"
+  if [[ -n "${HUTCH_OPENED:-}" ]]; then /bin/cp -f "$HUTCH_OPENED" "$dir/opened"; echo "opened: $(tr '\n' ' ' <"$dir/opened")"; fi
+  echo "workspace $dir at $(cat "$dir/base")"
+}
+
+# user_line prints one stream-json user message (Claude Code agent).
+user_line() {
+  python3 -I -c 'import json, sys; print(json.dumps({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": sys.argv[1]}]}}))' "$1"
+}
+
+# run_idle is true when the log's last event is a result, the log has not changed for HUTCH_IDLE_S seconds (default
+# 120) and no message was sent after it. A background task's notification also ends in a result, so counting results
+# per message does not work.
+run_idle() {
+  python3 -I - "$1" "$2" "${HUTCH_IDLE_S:-120}" <<'EOF'
+import json, os, sys, time
+log, steer, idle = sys.argv[1], sys.argv[2], int(sys.argv[3])
+last = None
+for line in open(log):
+    try:
+        last = json.loads(line).get("type")
+    except ValueError:
+        last = None
+quiet = time.time() - os.path.getmtime(log) >= idle
+sys.exit(0 if last == "result" and quiet and os.path.getmtime(steer) <= os.path.getmtime(log) else 1)
+EOF
+}
+
+kickoff() {
+  case "${HUTCH_PHASE:-}" in
+    design) echo "PHASE 1 (design only). Read /task/primer.md, /task/brief.md, /task/checklist.md and /task/project-checklist.md if it exists, then the sources the brief names. Write /out/design-notes.md exactly as the checklist's 'Design notes' section says. Do not change any file under /work, run no generator and commit nothing. Then stop with a two-line report." ;;
+    build) echo "PHASE 2 (build). Read /task/primer.md, /task/brief.md, /task/checklist.md, /task/project-checklist.md if it exists, and /out/design-notes.md; its 'Reviewer notes' section, if present, overrides the notes. Complete the task under your sandbox rules, following the design notes." ;;
+    "") echo "Read /task/primer.md, then /task/brief.md, /task/checklist.md and /task/project-checklist.md if it exists, and complete the task under your sandbox rules." ;;
+    *) die "HUTCH_PHASE must be design or build" ;;
+  esac
+}
+
+# The Claude Code session reads stream-json from steer.jsonl through tail, so hutch say reaches it mid-run. When the
+# session is idle (run_idle) or the sandbox has exited, tail is stopped and stdin closes, which ends the session.
+cmd_run() {
+  need_task "$1"
+  need_models
+  need_pro_kind "$1"
+  local task="$1" out steer tailpid msg
+  out="$(out_dir "$task")"; steer="$out/steer.jsonl"
+  msg="$(kickoff)"
+  /bin/rm -f "$out/tail.pid" "$out/exit.code"
+  # A later phase keeps the earlier phase's log.
+  [[ -s "$out/run.jsonl" ]] && /bin/mv -f "$out/run.jsonl" "$out/run.$(date +%Y%m%d%H%M%S).jsonl"
+  : >"$out/run.jsonl"
+  echo "$(date -u +%FT%TZ) agent=$AGENT provider=$PROVIDER kind=$KIND model=$MODEL small=$SMALL_MODEL phase=${HUTCH_PHASE:-}" >>"$out/models.log"
+  if [[ "$AGENT" == opencode ]]; then
+    # opencode run takes one message and exits when the agent stops; hutch say continues the session afterwards.
+    : >"$steer"
+    SANDBOX_CMD=(opencode run --standalone --auto --format json --title "$task" "$msg")
+    local rc=0
+    sandbox "$task" >"$out/run.jsonl" 2>"$out/run.err" || rc=$?
+    echo "$rc" >"$out/exit.code"
+    echo "log: $out/run.jsonl (sandbox exit $rc)"
+    return "$rc"
+  fi
+  user_line "$msg" >"$steer"
+  SANDBOX_CMD=(claude -p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions)
+  (
+    set +o pipefail
+    sh -c 'echo $$ >"$1"; exec tail -n +1 -f "$2"' _ "$out/tail.pid" "$steer" |
+      { sandbox "$task" -i >"$out/run.jsonl" 2>"$out/run.err"; echo $? >"$out/exit.code"; }
+  ) &
+  local job=$!
+  until [[ -s "$out/tail.pid" ]]; do sleep 0.2; done
+  tailpid="$(cat "$out/tail.pid")"
+  while :; do
+    if [[ -f "$out/exit.code" ]] || run_idle "$out/run.jsonl" "$steer"; then break; fi
+    sleep 5
+  done
+  kill "$tailpid" 2>/dev/null || true
+  wait "$job" || true
+  /bin/rm -f "$out/tail.pid"
+  echo "log: $out/run.jsonl (sandbox exit $(cat "$out/exit.code" 2>/dev/null || echo unknown))"
+  [[ "$(cat "$out/exit.code" 2>/dev/null)" == 0 ]]
+}
+
+cmd_say() {
+  need_task "$1"
+  need_models
+  need_pro_kind "$1"
+  local out; out="$(out_dir "$1")"
+  if [[ "$AGENT" == opencode ]]; then
+    [[ -f "$out/exit.code" ]] || die "$1 has no finished run; opencode takes a follow-up only after the run stops"
+    /bin/rm -f "$out/exit.code"
+    SANDBOX_CMD=(opencode run --standalone --auto --format json --continue "$2")
+    local rc=0
+    sandbox "$1" >>"$out/run.jsonl" 2>>"$out/run.err" || rc=$?
+    echo "$rc" >"$out/exit.code"
+    echo "follow-up done: $out/run.jsonl (sandbox exit $rc)"
+    return "$rc"
+  fi
+  if ! { [[ -s "$out/tail.pid" ]] && kill -0 "$(cat "$out/tail.pid")" 2>/dev/null; }; then die "no run of $1 is reading messages"; fi
+  user_line "$2" >>"$out/steer.jsonl"
+  echo "sent to $1"
+}
+
+cmd_shell() {
+  need_task "$1"
+  need_models
+  if [[ "$AGENT" == opencode ]]; then SANDBOX_CMD=(opencode --standalone --auto "${@:2}")
+  else SANDBOX_CMD=(claude --dangerously-skip-permissions "${@:2}"); fi
+  sandbox "$1" -it
+}
+
+cmd_export() {
+  need_task "$1"
+  local dir; dir="$(task_dir "$1")"
+  need_image "$PROJECT_IMAGE"
+  # git runs in a network-less container, so hooks or config the agent wrote never run on the host.
+  docker run --rm --network none --cap-drop ALL -v "$dir/repo:/work:ro" -v "$(out_dir "$1"):/out" \
+    -e GIT_CONFIG_NOSYSTEM=1 "$PROJECT_IMAGE" \
+    git -c core.hooksPath=/dev/null -c safe.directory=/work bundle create "/out/$1.bundle" "$(cat "$dir/base")..hutch/$1"
+}
+
+cmd_verify() {
+  need_task "$1"
+  local task="$1" dir out base ref bundle heads files f bad=0 tree
+  dir="$(task_dir "$task")"; out="$(out_dir "$task")"; base="$(cat "$dir/base")"; ref="refs/hutch/$task"
+  bundle="$out/$task.bundle"
+  ALLOW_FILE="$dir/allow"; OPENED_FILE="$dir/opened"
+  [[ -f "$bundle" ]] || die "no bundle; run hutch export $task"
+  git -C "$REPO" bundle verify --quiet "$bundle"
+  heads="$(git -C "$REPO" bundle list-heads "$bundle" | awk '$2 ~ /^refs\/heads\// { print $2 }')"
+  [[ -n "$heads" && "$(wc -l <<<"$heads")" -eq 1 ]] || die "the bundle must hold exactly one branch, has: ${heads:-none}"
+  git -C "$REPO" fetch --quiet --no-tags "$bundle" "+$heads:$ref"
+  git -C "$REPO" merge-base --is-ancestor "$base" "$ref" || die "$ref does not build on $base"
+  echo "== commits"; git -C "$REPO" log --oneline "$base..$ref"
+  echo "== files"
+  files="$(git -C "$REPO" diff --name-only "$base" "$ref")"
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    if protected "$f"; then echo "PROTECTED $f"; bad=1
+    elif ! allowed "$f"; then echo "NOT-ALLOWED $f"; bad=1
+    else echo "ok $f"; fi
+  done <<<"$files"
+  echo "== added comment lines"
+  git -C "$REPO" diff -U0 "$base" "$ref" -- . ':(exclude)*.md' |
+    grep -E '^\+[[:space:]]*(//|/\*|\*|#|--)' | grep -v '^+++' || echo "(none)"
+  [[ $bad -eq 0 ]] || die "path check failed"
+  [[ -f "$CONF/verify.sh" ]] || die "missing $CONF/verify.sh"
+  need_image "$PROJECT_IMAGE"
+  # The checks run the agent's code, so they run offline in a fresh container from a plain tree.
+  tree="$out/tree"; /bin/rm -rf "$tree"; mkdir -p "$tree"
+  git -C "$REPO" archive "$ref" | tar -x -C "$tree"
+  printf '%s\n' "$files" >"$out/changed.txt"
+  echo "== checks (offline container)"
+  if ! offline -v "$tree:/work" -v "$out/changed.txt:/task/changed.txt:ro" -v "$CONF/verify.sh:/task/verify.sh:ro" \
+    "$PROJECT_IMAGE" bash -euo pipefail /task/verify.sh /task/changed.txt 2>&1 | tee "$out/verify.log"; then
+    die "checks failed: $out/verify.log"
+  fi
+  echo "verify passed: now review the diff yourself: git -C $REPO diff $base $ref"
+}
+
+# Isolation probes inside the same sandbox the agent gets. Prints names, never the key's value.
+cmd_isolation() {
+  need_task "$1"
+  need_models
+  SANDBOX_CMD=(bash -c '
+    probe() { if timeout 8 bash -c "$2" >/dev/null 2>&1; then echo "REACHABLE $1"; else echo "blocked $1"; fi; }
+    echo "== egress"
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$HUTCH_PROBE_URL/v1/messages" -X POST -d "{}")
+    echo "model host via proxy http=$code"
+    for u in https://github.com https://proxy.golang.org https://registry.npmjs.org https://pypi.org https://api.anthropic.com; do
+      probe "proxy $u" "curl -sf --max-time 6 $u"; done
+    probe "direct https 1.1.1.1" "curl -sf --noproxy \"*\" --max-time 6 https://1.1.1.1"
+    probe "dns github.com" "getent hosts github.com"
+    gw=$(ip route 2>/dev/null | awk "/default/{print \$3}"); gw=${gw:-172.17.0.1}
+    for p in 22 80 2375 2376 3306 4222 5432 6379 6380 8222 27017; do
+      probe "host.docker.internal:$p" "echo > /dev/tcp/host.docker.internal/$p"
+      probe "gateway:$p" "echo > /dev/tcp/$gw/$p"; done
+    echo "== identity and mounts"
+    id
+    grep -vE " (proc|sysfs|cgroup2?|mqueue|devpts|tmpfs|overlay|shm) " /proc/mounts | awk "{print \$2}"
+    for d in .ssh .kube .aws .config/gh .docker .pgpass .netrc; do [ -e "$HOME/$d" ] && echo "PRESENT ~/$d"; done
+    ls /var/run/docker.sock 2>/dev/null && echo "PRESENT docker.sock"
+    echo "== env names"; env | cut -d= -f1 | sort | tr "\n" " "; echo
+    echo "token length ${#ANTHROPIC_AUTH_TOKEN} ${#OPENCODE_API_KEY}"
+    echo "== capabilities"; grep CapEff /proc/self/status
+  ')
+  sandbox "$1" -i
+}
+
+cmd_smoke() {
+  need_task "$1"
+  need_models
+  if [[ "$AGENT" == opencode ]]; then SANDBOX_CMD=(opencode run --standalone --format json "Reply with exactly: OK")
+  else SANDBOX_CMD=(claude -p "Reply with exactly: OK" --output-format json); fi
+  sandbox "$1" -i
+}
+
+cmd_rm() {
+  [[ "${1:-}" =~ ^[a-z0-9-]+$ ]] || die "task name must match [a-z0-9-]+"
+  /bin/rm -rf "$(task_dir "$1")" "$(out_dir "$1")"
+  git -C "$REPO" update-ref -d "refs/hutch/$1" 2>/dev/null || true
+}
+
+cmd_models() {
+  echo "provider $PROVIDER ($MODELS_FILE):"
+  grep -v '^#' "$MODELS_FILE"
+  echo "skipped (${HUTCH_HOME}/skip):"
+  cat "${HUTCH_HOME}/skip" 2>/dev/null || true
+}
+
+usage() { sed -n '2,16p' "${HUTCH_DIR}/hutch"; }
+
+# All code lives in functions and main runs last, so bash has parsed the whole file before anything executes: a git
+# pull that rewrites this file during a long run cannot change the running command.
+main() {
+  setup_provider
+  [[ $# -gt 0 ]] || { usage; exit 2; }
+  local cmd="$1"; shift
+  case "$cmd" in
+    status) cmd_status ;;
+    models) cmd_models ;;
+    help|-h|--help) usage ;;
+    init) cmd_init "${1:-}" ;;
+    build) cmd_build ;;
+    *)
+      need_project
+      case "$cmd" in
+        new) [[ $# -eq 3 ]] || die "usage: hutch new <task> <allow-file> <brief-file>"; cmd_new "$@" ;;
+        run) cmd_run "${1:-}" ;;
+        say) [[ $# -eq 2 ]] || die "usage: hutch say <task> <message>"; cmd_say "$@" ;;
+        shell) cmd_shell "$@" ;;
+        export) cmd_export "${1:-}" ;;
+        verify) cmd_verify "${1:-}" ;;
+        rm) cmd_rm "${1:-}" ;;
+        isolation) cmd_isolation "${1:-}" ;;
+        smoke) cmd_smoke "${1:-}" ;;
+        needs-pro) need_task "${1:-}"; needs_pro "$(task_dir "$1")/allow" "$(task_dir "$1")/opened" ;;
+        *) usage; exit 2 ;;
+      esac ;;
+  esac
+}
+
+[[ "${HUTCH_LIB:-}" == 1 ]] || main "$@"

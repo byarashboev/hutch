@@ -1,0 +1,11 @@
+# hutch project config: key=value lines, read by hutch (never executed); hutch init appends name= and repo=.
+# The branch new tasks clone, and the branch build reads dependency manifests from.
+base_branch=main
+# ERE of the dependency manifests copied into the image build (from the base branch), so the image can warm its
+# caches. Leave empty when the Dockerfile needs no project files.
+manifests=
+# Container path of a persistent cache volume shared by this project's tasks (for example a build cache). Optional.
+cache_mount=
+# Sandbox limits.
+memory=12g
+pids=2048

@@ -1,0 +1,2 @@
+# Per-user state never lives here.
+.DS_Store

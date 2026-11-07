@@ -1,0 +1,31 @@
+# Paths the sandbox agent may never change (bash globs, one per line; * also matches /). hutch verify rejects a diff
+# that touches one, unless the pattern is in openable and the task opened it. .hutch/* is always protected.
+# Agent instructions and editor settings
+AGENTS.md
+CLAUDE.md
+.claude/*
+# CI and build
+.github/*
+.gitlab-ci.yml
+Makefile
+*Dockerfile*
+compose.yaml
+docker-compose*.yml
+# Dependencies
+*package.json
+*package-lock.json
+*pnpm-lock.yaml
+*yarn.lock
+*go.mod
+*go.sum
+*requirements*.txt
+*pyproject.toml
+*poetry.lock
+*Cargo.toml
+*Cargo.lock
+# Secrets and environment
+.env*
+*/.env*
+# Repository settings
+.gitignore
+.gitattributes

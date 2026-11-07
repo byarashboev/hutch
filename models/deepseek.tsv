@@ -1,0 +1,12 @@
+# Direct DeepSeek API model choice by the kind of work (HUTCH_KIND), same kinds as opencode.tsv.
+# Owner 2026-11-07: Pro for concurrency, race conditions and architecture; Flash for everything else.
+# This replaces the 2026-11-05 Flash-only rule. deepseek-flash always serves the latest Flash.
+# The API bills per token, so each row needs only one model; ~/.hutch/skip still applies.
+# kind	models
+concurrency	deepseek-v4-pro[1m]
+design	deepseek-v4-pro[1m]
+go	deepseek-flash[1m]
+ui	deepseek-flash[1m]
+script	deepseek-flash[1m]
+test	deepseek-flash[1m]
+small	deepseek-flash[1m]

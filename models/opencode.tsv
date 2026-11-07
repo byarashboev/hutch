@@ -1,0 +1,16 @@
+# OpenCode Go model choice by the kind of work (HUTCH_KIND). The first model not listed in ~/.hutch/skip wins.
+# Each model has its own monthly limit (Go $10 plan, 2026-11-07), so spreading kinds spreads the budget.
+# Limits: deepseek-v4.1-flash $100; glm-5.3-flash, glm-5.2, kimi-k2.7-code, qwen3.7-plus, mimo-v2.6-flash $60;
+# deepseek-v4-pro, kimi-k3, glm-5.3, qwen3.8-max $15.
+# Owner 2026-11-07: DeepSeek Pro for concurrency, race conditions and architecture; Flash for UI, scripts and
+# templates. This replaces the 2026-11-05 Flash-only rule on this route. Pro's $15 limit is the smallest, so only
+# concurrency and design start on it.
+# kind	models
+concurrency	deepseek-v4-pro kimi-k3 glm-5.3
+design	deepseek-v4-pro kimi-k3 glm-5.3 qwen3.8-max
+go	deepseek-v4.1-flash glm-5.2 kimi-k2.7-code
+ui	deepseek-v4.1-flash kimi-k2.7-code qwen3.7-plus
+script	deepseek-v4.1-flash glm-5.3-flash mimo-v2.6-flash
+test	deepseek-v4.1-flash glm-5.3-flash glm-5.2
+# small serves the agents' background calls and helper subagents, so they do not spend the main model's limit.
+small	glm-5.3-flash mimo-v2.6-flash deepseek-v4.1-flash
