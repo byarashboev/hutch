@@ -2,6 +2,13 @@
 
 # hutch
 
+**Let Claude Code, Codex or any host agent hand bounded coding tasks to cheaper models (DeepSeek, Kimi, GLM, Qwen via
+OpenCode Go, or the DeepSeek API) in a locked-down Docker sandbox, then verify the result before it reaches your
+repository.**
+
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Agent skill](https://img.shields.io/badge/agent%20skill-SKILL.md-6366F1.svg)](skills/hutch/SKILL.md)
+
 hutch hands one bounded coding task to a cheaper coding agent running in an isolated container, and gives the result
 back to your main agent (or to you) for review. The sandbox agent writes the code; the host side writes the brief and
 verifies.
@@ -12,6 +19,27 @@ verifies.
   model API through an allowlist proxy. Results come back as a git bundle; the host never runs git inside the
   agent's clone.
 - **Any project:** each project describes its toolchain, checks and protected paths in a small config directory.
+
+## Why
+
+- **Cost.** Your strong model writes a short brief and reviews a diff; a cheap model does the reading, coding, testing
+  and committing.
+- **Containment.** The sandbox has no capabilities and its own clone of the repository, and reaches nothing but the
+  model API: no package registry, Git host, DNS or host port.
+- **Verification.** `hutch verify` rejects any change outside the task's allow list or in a protected path, then runs
+  the project's checks offline. You (or your agent) still review the diff before taking the commits.
+
+## Example run
+
+One task on a small Node project: add seconds and days to a duration parser and reject invalid input.
+
+| | |
+|---|---|
+| Model | `HUTCH_KIND=script` → `deepseek-v4.1-flash` on OpenCode Go |
+| Time | 7 min 18 s, exit 0 |
+| Result | 3 commits, 2 files, tests from 2 to 15, a self-review with a 10-mutation table |
+| `hutch verify` | both paths allowed, 15/15 tests pass in the offline container |
+| `hutch isolation` | model host reachable; GitHub, npm, PyPI, DNS and host ports blocked; `CapEff` all zeros |
 
 ## How it works
 
@@ -32,7 +60,7 @@ you          review the diff, take the commits
 - macOS or Linux with Docker. On macOS the system bash 3.2 is enough.
 - `git`, `python3` (only for the Claude Code agent's mid-run messages).
 - An OpenCode Go subscription or a DeepSeek API key.
-- The pinned opencode binary is arm64 only for now; on x86-64 add its sha256 to `image/Dockerfile`.
+- arm64 or x86-64 (amd64): the opencode binary is pinned by sha256 for both in `image/Dockerfile`.
 
 ## Install
 
