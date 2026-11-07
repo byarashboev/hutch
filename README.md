@@ -109,9 +109,4 @@ its own items in its `checklist.md`; nothing project-specific goes into this rep
 
 ## License
 
-Copyright (c) 2026 Yarashboev Bahodir. hutch is licensed under the [PolyForm Shield License 1.0.0](LICENSE).
-
-You may use, change and share hutch for any purpose, including commercial work, except to provide a product that
-competes with hutch or with a product the licensor provides using it. This is a source-available license, not an
-OSI-approved open-source license. For other terms, contact the author through
-[GitHub](https://github.com/byarashboev).
+Copyright 2026 Yarashboev Bahodir. Licensed under the [Apache License, Version 2.0](LICENSE); see [NOTICE](NOTICE).
