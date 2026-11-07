@@ -147,6 +147,7 @@ Ask these questions together, each with your drafted answer and the reason for i
 
 - Update: `git -C <this directory> pull`, then `hutch build` when `image/` or `proxy/` changed. A pull during a running
   task is safe: the script is parsed completely before it runs.
-- Changing the script: keep it compatible with bash 3.2 (macOS), run `shellcheck hutch` and `test/run.sh`, and keep
-  this file, the README and `skills/hutch/SKILL.md` in step with it.
+- Changing the script: keep it compatible with bash 3.2 (macOS), run `shellcheck hutch test/*.sh`, `test/run.sh` and,
+  with Docker, `test/e2e.sh` (CI runs all three), and keep this file, the README and `skills/hutch/SKILL.md` in step
+  with it.
 - Project-specific knowledge never goes into this repository: it belongs in the project's config directory.

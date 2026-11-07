@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck hutch test/*.sh
+      - name: unit tests
+        run: bash test/run.sh
+
+  unit-macos:
+    # The system bash on macOS is 3.2; hutch must keep working with it.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: unit tests (bash 3.2)
+        run: /bin/bash test/run.sh
+
+  e2e:
+    # Builds the images on x86-64 and runs export and verify against a throwaway project; no model is called.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: end-to-end
+        run: bash test/e2e.sh
