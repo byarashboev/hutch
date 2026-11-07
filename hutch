@@ -339,8 +339,9 @@ cmd_build() {
   trap 'rm -rf "$BUILD_CTX"' EXIT
   mkdir "$BUILD_CTX/src"
   re="$(conf_get manifests)"
-  branch="$(base_branch)"
-  # Dependency manifests only, from the committed base branch: the image changes when dependencies do.
+  branch="${HUTCH_BRANCH:-$(base_branch)}"
+  # Dependency manifests only, from the committed base branch or $HUTCH_BRANCH, the branch tasks will clone: the
+  # image changes when dependencies do, and a task on a branch that adds one still builds offline.
   if [[ -n "$re" ]]; then
     files="$(git -C "$REPO" ls-tree -r --name-only "$branch" | grep -E -- "$re" || true)"
     [[ -n "$files" ]] || die "manifests=$re matches no file on $branch"
