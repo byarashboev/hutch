@@ -91,6 +91,13 @@ Environment: `HUTCH_KIND`, `HUTCH_MODEL`, `HUTCH_SMALL_MODEL`, `HUTCH_PHASE` (`d
 `HUTCH_PROVIDER`, `HUTCH_BRANCH`, `HUTCH_OPENED`, `HUTCH_PROJECT` (use a home config from outside the repository),
 `HUTCH_HOME` (default `~/.hutch`), `HUTCH_API_KEY`, `HUTCH_MEMORY`, `HUTCH_PIDS`, `HUTCH_EFFORT`, `HUTCH_IDLE_S`.
 
+## Agent skill
+
+[skills/hutch/SKILL.md](skills/hutch/SKILL.md) is a short [Agent Skill](https://agentskills.io) that teaches a host
+agent the hutch loop: check `hutch status`, write the brief, run, verify, review the diff. Install it for Claude Code
+with `mkdir -p ~/.claude/skills && ln -s ~/hutch/skills/hutch ~/.claude/skills/hutch`; other agents read the same
+`SKILL.md` from their own skills directory. [AGENTS.md](AGENTS.md) stays the full guide.
+
 ## Universal rules
 
 [rules/sandbox.md](rules/sandbox.md) is what the sandbox agent always follows, and
