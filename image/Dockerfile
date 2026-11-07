@@ -9,6 +9,7 @@ ARG TARGETARCH
 RUN set -eu; \
     case "$TARGETARCH" in \
       arm64) asset=opencode-linux-arm64.tar.gz; sum=f2d27600c367e45057d6a16f6a5c2aa8d77b41a9b10d4bc3d849c2f88870e944 ;; \
+      amd64) asset=opencode-linux-x64.tar.gz; sum=08bb21d6326ce740d91cce7ebe88a6536933f6e1e30353b91a06b01f25da306c ;; \
       *) echo "hutch: no pinned opencode v2.2.6 sha256 for $TARGETARCH; add it to image/Dockerfile" >&2; exit 1 ;; \
     esac; \
     curl -fsSL -o /tmp/oc.tgz "https://github.com/anomalyco/opencode/releases/download/v2.2.6/$asset"; \
