@@ -128,10 +128,12 @@ Ask these questions together, each with your drafted answer and the reason for i
 8. `hutch export <task>`, then `hutch verify <task>`: it checks that every changed path is allowed and not protected,
    lists added comment lines, names changes to existing tests (deleted files, removed lines, skip markers), and runs
    `verify.sh` offline. Treat every named test change as a finding to check in the diff.
-9. **Review the diff yourself** (`git -C <repo> diff <base> refs/hutch/<task>`). `verify` passing is not acceptance.
-10. Take the work: create your branch from `refs/hutch/<task>` (or cherry-pick its commits) in the project, then
+9. `hutch report <task>` gives the model, usage, commits, verify status and test changes in one page (`report.md`);
+   start the review from it.
+10. **Review the diff yourself** (`git -C <repo> diff <base> refs/hutch/<task>`). `verify` passing is not acceptance.
+11. Take the work: create your branch from `refs/hutch/<task>` (or cherry-pick its commits) in the project, then
     continue with the project's normal process (tests that need services, review, pull request).
-11. `hutch rm <task>` when it is merged or abandoned.
+12. `hutch rm <task>` when it is merged or abandoned.
 
 ### Verification rules
 

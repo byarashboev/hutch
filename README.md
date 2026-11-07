@@ -58,7 +58,7 @@ you          review the diff, take the commits
 ## Requirements
 
 - macOS or Linux with Docker. On macOS the system bash 3.2 is enough.
-- `git`, `python3` (only for the Claude Code agent's mid-run messages).
+- `git`, `python3` (for `hutch report` and the Claude Code agent's mid-run messages).
 - An OpenCode Go subscription or a DeepSeek API key.
 - arm64 or x86-64 (amd64): the opencode binary is pinned by sha256 for both in `image/Dockerfile`.
 
@@ -113,6 +113,7 @@ computer, for shared repositories). hutch looks in that order.
 | `hutch say <task> <message>` | follow-up message |
 | `hutch shell <task>` | interactive agent session in the sandbox |
 | `hutch export <task>` / `hutch verify <task>` | bundle the result / check it on the host |
+| `hutch report <task>` | model, tokens, time, commits, verify status and test changes; kept as `report.md` |
 | `hutch rm <task>` | remove the task |
 | `hutch smoke <task>` / `hutch isolation <task>` | model call / isolation probes |
 | `hutch models` | model per kind, skipped models |

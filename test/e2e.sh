@@ -87,6 +87,11 @@ check "isolation: GitHub, npm and DNS are blocked" '[[ "$out" == *"blocked proxy
 check "isolation: no capabilities and no credential directories" '[[ "$out" == *"CapEff:"*"0000000000000000"* && "$out" != *PRESENT* ]]'
 check "isolation: the model host answers through the proxy" '[[ "$out" =~ model\ host\ via\ proxy\ http=[1-5][0-9][0-9] ]]'
 
+out="$("$hutch" report clean 2>&1)" || true
+check "report shows the verify outcome, the commit and the test changes" '[[ "$out" == *"verify: passed"* && "$out" == *"agent: clean"* && "$out" == *"extended test/math.test.js"* ]]'
+out="$("$hutch" report broken 2>&1)" || true
+check "report shows a failed verify" '[[ "$out" == *"verify: failed: checks failed"* ]]'
+
 for t in clean outside hide broken weaken slow; do "$hutch" rm "$t"; done
 echo "failures: $fails"
 [[ $fails -eq 0 ]]

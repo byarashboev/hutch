@@ -97,6 +97,23 @@ printf 'tests=^spec/\n' >"$CONF/config"
 out="$(test_changes "$trbase" "$trref")"
 check "a project tests= pattern replaces the default" '[[ "$out" == *"no changes to existing tests"* ]]'
 
+# Usage from the agents' logs: opencode step_finish events and Claude Code result events, across every phase's log.
+UO="$tmp/usage"; mkdir -p "$UO"
+cat >"$UO/run.jsonl" <<'EOF'
+{"type":"step_start","timestamp":1000}
+{"type":"step_finish","timestamp":61000,"part":{"type":"step-finish","cost":0.01,"tokens":{"input":100,"output":20,"reasoning":5,"cache":{"read":50,"write":0}}}}
+not json
+{"type":"step_finish","timestamp":121000,"part":{"type":"step-finish","cost":0.02,"tokens":{"input":200,"output":30,"reasoning":0,"cache":{"read":0,"write":10}}}}
+EOF
+cat >"$UO/run.20261108010101.jsonl" <<'EOF'
+{"type":"result","duration_ms":30000,"total_cost_usd":0.5,"usage":{"input_tokens":1000,"output_tokens":100,"cache_read_input_tokens":500,"cache_creation_input_tokens":0}}
+EOF
+out="$(run_usage "$UO")"
+check "run_usage sums tokens across agents and phases" '[[ "$out" == *"input 1300, output 150, reasoning 5, cache read 550, cache write 10"* ]]'
+check "run_usage sums reported cost and agent time" '[[ "$out" == *"cost reported 0.53"* && "$out" == *"agent time 150s"* ]]'
+out="$(run_usage "$tmp/nothing-here")"
+check "run_usage with no logs says so" '[[ "$out" == *"no run logs"* ]]'
+
 # Path rules.
 CONF="$tmp/conf"; mkdir -p "$CONF"
 printf '# c\nMakefile\ncontracts/*\n*/migrations/*\n' >"$CONF/protected"

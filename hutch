@@ -9,6 +9,7 @@
 #   hutch shell <task>               interactive agent session in the sandbox
 #   hutch export <task>              write the task branch as a git bundle
 #   hutch verify <task>              fetch the bundle on the host, check paths, run the project's checks offline
+#   hutch report <task>              the task's model, usage, commits, verify status and test changes (report.md)
 #   hutch rm <task>                  remove a task workspace, its output and its ref
 #   hutch smoke|isolation <task>     one-line model call | egress, mount and capability probes
 #   hutch models                     the model chosen per HUTCH_KIND and the skipped models
@@ -556,11 +557,14 @@ cmd_verify() {
   bundle="$out/$task.bundle"
   ALLOW_FILE="$dir/allow"; OPENED_FILE="$dir/opened"
   [[ -f "$bundle" ]] || die "no bundle; run hutch export $task"
+  # The outcome is kept for hutch report; every failure below goes through vfail.
+  vfail() { echo "failed: $*" >"$out/verify.status"; die "$*"; }
+  echo "running" >"$out/verify.status"
   git -C "$REPO" bundle verify --quiet "$bundle"
   heads="$(git -C "$REPO" bundle list-heads "$bundle" | awk '$2 ~ /^refs\/heads\// { print $2 }')"
-  [[ -n "$heads" && "$(wc -l <<<"$heads")" -eq 1 ]] || die "the bundle must hold exactly one branch, has: ${heads:-none}"
+  [[ -n "$heads" && "$(wc -l <<<"$heads")" -eq 1 ]] || vfail "the bundle must hold exactly one branch, has: ${heads:-none}"
   git -C "$REPO" fetch --quiet --no-tags "$bundle" "+$heads:$ref"
-  git -C "$REPO" merge-base --is-ancestor "$base" "$ref" || die "$ref does not build on $base"
+  git -C "$REPO" merge-base --is-ancestor "$base" "$ref" || vfail "$ref does not build on $base"
   echo "== commits"; git -C "$REPO" log --oneline "$base..$ref"
   echo "== files"
   files="$(git -C "$REPO" diff --name-only "$base" "$ref")"
@@ -576,9 +580,9 @@ cmd_verify() {
   echo "== test changes"
   local tests_ok=0
   test_changes "$base" "$ref" || tests_ok=1
-  [[ $bad -eq 0 ]] || die "path check failed"
-  [[ $tests_ok -eq 0 ]] || die "existing tests were changed and tests_policy=append-only"
-  [[ -f "$CONF/verify.sh" ]] || die "missing $CONF/verify.sh"
+  [[ $bad -eq 0 ]] || vfail "path check failed"
+  [[ $tests_ok -eq 0 ]] || vfail "existing tests were changed and tests_policy=append-only"
+  [[ -f "$CONF/verify.sh" ]] || vfail "missing $CONF/verify.sh"
   need_image "$PROJECT_IMAGE"
   # The checks run the agent's code, so they run offline in a fresh container from a plain tree.
   tree="$out/tree"; /bin/rm -rf "$tree"; mkdir -p "$tree"
@@ -590,9 +594,101 @@ cmd_verify() {
   offline -v "$tree:/work" -v "$out/changed.txt:/task/changed.txt:ro" -v "$CONF/verify.sh:/task/verify.sh:ro" \
     "$PROJECT_IMAGE" timeout -k 10 "$limit" bash -euo pipefail /task/verify.sh /task/changed.txt 2>&1 |
     tee "$out/verify.log" || rc=$?
-  [[ $rc -eq $TIMED_OUT ]] && die "checks hit their ${limit}s limit (HUTCH_VERIFY_TIMEOUT / verify_timeout): $out/verify.log"
-  [[ $rc -eq 0 ]] || die "checks failed: $out/verify.log"
+  [[ $rc -eq $TIMED_OUT ]] && vfail "checks hit their ${limit}s limit (HUTCH_VERIFY_TIMEOUT / verify_timeout): $out/verify.log"
+  [[ $rc -eq 0 ]] || vfail "checks failed: $out/verify.log"
+  echo "passed" >"$out/verify.status"
   echo "verify passed: now review the diff yourself: git -C $REPO diff $base $ref"
+}
+
+# run_usage sums what the agents' logs in out directory $1 report: opencode step_finish events and Claude Code result
+# events, over every phase's log (run.jsonl and the run.<time>.jsonl files an earlier phase left).
+run_usage() {
+  python3 -I - "$1" <<'EOF'
+import glob, json, os, sys
+logs = sorted(glob.glob(os.path.join(sys.argv[1], "run*.jsonl")))
+if not logs:
+    print("no run logs")
+    sys.exit(0)
+t = dict(input=0, output=0, reasoning=0, read=0, write=0)
+cost = 0.0
+secs = 0.0
+for log in logs:
+    first = last = None
+    for line in open(log, errors="replace"):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(e, dict):
+            continue
+        ts = e.get("timestamp")
+        if isinstance(ts, (int, float)):
+            first = ts if first is None else first
+            last = ts
+        part = e.get("part") or {}
+        if e.get("type") == "step_finish" or part.get("type") == "step-finish":
+            k = part.get("tokens") or {}
+            c = k.get("cache") or {}
+            t["input"] += k.get("input", 0); t["output"] += k.get("output", 0); t["reasoning"] += k.get("reasoning", 0)
+            t["read"] += c.get("read", 0); t["write"] += c.get("write", 0)
+            cost += part.get("cost") or 0
+        elif e.get("type") == "result":
+            u = e.get("usage") or {}
+            t["input"] += u.get("input_tokens", 0); t["output"] += u.get("output_tokens", 0)
+            t["read"] += u.get("cache_read_input_tokens", 0); t["write"] += u.get("cache_creation_input_tokens", 0)
+            cost += e.get("total_cost_usd") or 0
+            secs += (e.get("duration_ms") or 0) / 1000
+    if first is not None and last is not None:
+        secs += (last - first) / 1000
+print("tokens: input %(input)d, output %(output)d, reasoning %(reasoning)d, cache read %(read)d, cache write %(write)d" % t
+      + "; cost reported %.2f; agent time %ds" % (cost, secs))
+EOF
+}
+
+# cmd_report prints one task's outcome for the reviewer and keeps it as report.md: model, exit code, usage, commits,
+# verify status, test changes and the files to read. It reads git only in the host repository, never in the agent's
+# clone, so it lists commits after hutch export and hutch verify.
+cmd_report() {
+  need_task "$1"
+  local task="$1" dir out base ref
+  dir="$(task_dir "$task")"; out="$(out_dir "$task")"; base="$(cat "$dir/base")"; ref="refs/hutch/$task"
+  {
+    echo "# hutch report: $task"
+    echo
+    echo "- project: $NAME ($REPO)"
+    echo "- base: $base"
+    echo "- runs:"
+    if [[ -s "$out/models.log" ]]; then sed 's/^/  - /' "$out/models.log"; else echo "  - none"; fi
+    echo "- run exit code: $(cat "$out/exit.code" 2>/dev/null || echo 'none')"
+    echo "- $(run_usage "$out")"
+    echo "- verify: $(cat "$out/verify.status" 2>/dev/null || echo 'not run')"
+    echo
+    if git -C "$REPO" rev-parse --verify --quiet "$ref" >/dev/null; then
+      echo "## Commits"
+      echo
+      git -C "$REPO" log --format='- %h %s' "$base..$ref"
+      echo
+      echo "## Diff"
+      echo
+      echo '```'
+      git -C "$REPO" diff --stat "$base" "$ref"
+      echo '```'
+      echo
+      echo "## Test changes"
+      echo
+      test_changes "$base" "$ref" | sed 's/^/- /' || true
+    else
+      echo "No commits on the host yet: run hutch export $task, then hutch verify $task."
+    fi
+    echo
+    echo "## To review"
+    echo
+    local f
+    for f in self-review.md design-notes.md verify.log run.err; do
+      [[ -s "$out/$f" ]] && echo "- $out/$f"
+    done
+    echo "- git -C $REPO diff $base $ref"
+  } | tee "$out/report.md"
 }
 
 # Isolation probes inside the same sandbox the agent gets. Prints names, never the key's value.
@@ -646,7 +742,7 @@ cmd_models() {
   cat "${HUTCH_HOME}/skip" 2>/dev/null || true
 }
 
-usage() { sed -n '2,16p' "${HUTCH_DIR}/hutch"; }
+usage() { sed -n '2,/^# Agents:/p' "${HUTCH_DIR}/hutch"; }
 
 # All code lives in functions and main runs last, so bash has parsed the whole file before anything executes: a git
 # pull that rewrites this file during a long run cannot change the running command.
@@ -672,6 +768,7 @@ main() {
         rm) cmd_rm "${1:-}" ;;
         isolation) cmd_isolation "${1:-}" ;;
         smoke) cmd_smoke "${1:-}" ;;
+        report) cmd_report "${1:-}" ;;
         needs-pro) need_task "${1:-}"; needs_pro "$(task_dir "$1")/allow" "$(task_dir "$1")/opened" ;;
         *) usage; exit 2 ;;
       esac ;;

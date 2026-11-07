@@ -37,9 +37,10 @@ themselves.
 5. Check `exit.code` is 0 and `run.err` is empty in `~/.hutch/state/<project>/out/<task>/`. Read `self-review.md`.
 6. Follow-ups: `hutch say <task> "<message>"`.
 7. `hutch export <task>`, then `hutch verify <task>` (path rules plus the project's offline checks).
-8. **Review the diff yourself:** `git -C <repo> diff <base> refs/hutch/<task>`. A passing `verify` is not acceptance.
-9. Take the work from `refs/hutch/<task>` (branch or cherry-pick) and continue with the project's normal process.
-10. `hutch rm <task>` when merged or abandoned.
+8. `hutch report <task>`: model, usage, commits, verify status and test changes on one page.
+9. **Review the diff yourself:** `git -C <repo> diff <base> refs/hutch/<task>`. A passing `verify` is not acceptance.
+10. Take the work from `refs/hutch/<task>` (branch or cherry-pick) and continue with the project's normal process.
+11. `hutch rm <task>` when merged or abandoned.
 
 ## Verification rules
 
