@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/logo.svg" width="128" alt="hutch logo"></p>
+<p align="center"><img src="assets/banner.png" alt="hutch: hand coding tasks to cheaper models in a locked-down sandbox, verify before you merge"></p>
 
 # hutch
 
