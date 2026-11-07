@@ -208,6 +208,39 @@ needs_pro() {
   return 1
 }
 
+# Test files when the project config has no tests= pattern (an ERE over repository paths).
+DEFAULT_TESTS='(^|/)(tests?|__tests__|specs?)/|[._-](test|spec)\.[A-Za-z0-9]+$|_test\.go$|(^|/)test_[^/]*\.py$'
+# Added lines that skip or focus tests, in the common frameworks.
+SKIP_MARKERS='\.(skip|only|todo)\(|(^|[^A-Za-z0-9_])(xit|xdescribe|xtest|fit|fdescribe)\(|t\.Skip|@pytest\.mark\.(skip|xfail)|@unittest\.skip|@Disabled|@Ignore|#\[ignore\]'
+
+# test_changes names what a task did to the project's tests between commits $1 and $2: deleted test files, lines
+# removed from existing ones, added skip or focus markers, and new test files. A cheap model that cannot make a test
+# pass may weaken it instead, and the checks would still pass. With tests_policy=append-only any of those fails.
+test_changes() {
+  local base="$1" ref="$2" re policy st f n skips bad=0
+  re="$(conf_get tests)"; re="${re:-$DEFAULT_TESTS}"
+  policy="$(conf_get tests_policy)"; policy="${policy:-report}"
+  [[ "$policy" == report || "$policy" == append-only ]] || die "tests_policy must be report or append-only"
+  while IFS=$'\t' read -r st f; do
+    if [[ -z "$f" ]] || ! grep -qE -- "$re" <<<"$f"; then continue; fi
+    case "$st" in
+      D) echo "DELETED $f"; bad=1; continue ;;
+      A) echo "new $f" ;;
+      *) n="$(git -C "$REPO" diff --numstat --no-renames "$base" "$ref" -- "$f" | awk '{ print $1 " " $2 }')"
+         if [[ "${n#* }" != 0 ]]; then echo "EDITED $f (-${n#* })"; bad=1; else echo "extended $f (+${n% *})"; fi ;;
+    esac
+    skips="$(git -C "$REPO" diff -U0 --no-renames "$base" "$ref" -- "$f" | grep -E '^\+' | grep -v '^+++' |
+      grep -E -- "$SKIP_MARKERS" || true)"
+    if [[ -n "$skips" ]]; then
+      while IFS= read -r n; do echo "SKIP $f: ${n#+}"; done <<<"$skips"
+      bad=1
+    fi
+  done < <(git -C "$REPO" diff --name-status --no-renames "$base" "$ref")
+  [[ $bad -eq 1 ]] || echo "(no changes to existing tests)"
+  [[ "$policy" == append-only && $bad -eq 1 ]] && return 1
+  return 0
+}
+
 need_pro_kind() {
   local dir reason k pro=" "
   dir="$(task_dir "$1")"
@@ -540,7 +573,11 @@ cmd_verify() {
   echo "== added comment lines"
   git -C "$REPO" diff -U0 "$base" "$ref" -- . ':(exclude)*.md' |
     grep -E '^\+[[:space:]]*(//|/\*|\*|#|--)' | grep -v '^+++' || echo "(none)"
+  echo "== test changes"
+  local tests_ok=0
+  test_changes "$base" "$ref" || tests_ok=1
   [[ $bad -eq 0 ]] || die "path check failed"
+  [[ $tests_ok -eq 0 ]] || die "existing tests were changed and tests_policy=append-only"
   [[ -f "$CONF/verify.sh" ]] || die "missing $CONF/verify.sh"
   need_image "$PROJECT_IMAGE"
   # The checks run the agent's code, so they run offline in a fresh container from a plain tree.

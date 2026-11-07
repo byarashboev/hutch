@@ -68,6 +68,35 @@ check "the opencode agent runs under the run limit" '[[ "$(cat "$tmp/cmd")" == "
 check "a timed-out run records 124 and says so" '[[ $rc -eq 124 && "$(cat "$STATE/out/slow/exit.code")" == 124 && "$out" == *"600s limit"* ]]'
 unset -f sandbox
 
+# Test changes: deleted test files, lines removed from existing tests and new skip markers are named.
+TR="$tmp/testrepo"; git init -q -b main "$TR"
+mkdir -p "$TR/test" "$TR/src"
+printf 'a\nb\nc\n' >"$TR/test/a.test.js"; printf 'x\n' >"$TR/test/b.test.js"; printf 'y\n' >"$TR/src/gone_test.go"
+printf 'code\n' >"$TR/src/app.js"
+git -C "$TR" add -A; git -C "$TR" -c user.name=t -c user.email=t@t commit -qm base
+trbase="$(git -C "$TR" rev-parse HEAD)"
+printf 'a\nc\n' >"$TR/test/a.test.js"; printf 'x\ntest.skip("later", () => {});\n' >"$TR/test/b.test.js"
+rm "$TR/src/gone_test.go"; printf 'new\n' >"$TR/test/c.test.js"; printf 'code2\n' >"$TR/src/app.js"
+git -C "$TR" add -A; git -C "$TR" -c user.name=t -c user.email=t@t commit -qm agent
+trref="$(git -C "$TR" rev-parse HEAD)"
+REPO="$TR"; CONF="$tmp/trconf"; mkdir -p "$CONF"; : >"$CONF/config"
+out="$(test_changes "$trbase" "$trref")"; rc=$?
+check "a deleted test file is named" '[[ "$out" == *"DELETED src/gone_test.go"* ]]'
+check "lines removed from an existing test are named" '[[ "$out" == *"EDITED test/a.test.js (-1)"* ]]'
+check "a new skip marker is named" '[[ "$out" == *"SKIP test/b.test.js"* ]]'
+check "a test with only added lines is listed as extended" '[[ "$out" == *"extended test/b.test.js (+1)"* ]]'
+check "a new test file is listed, source files are not" '[[ "$out" == *"new test/c.test.js"* && "$out" != *app.js* ]]'
+check "the default policy only reports" '[[ $rc -eq 0 ]]'
+printf 'tests_policy=append-only\n' >"$CONF/config"
+test_changes "$trbase" "$trref" >/dev/null; rc=$?
+check "append-only fails on changed tests" '[[ $rc -ne 0 ]]'
+git -C "$TR" -c user.name=t -c user.email=t@t commit -q --allow-empty -m none
+out="$(test_changes "$trref" "$(git -C "$TR" rev-parse HEAD)")"; rc=$?
+check "append-only passes when existing tests are untouched" '[[ $rc -eq 0 && "$out" == *"no changes to existing tests"* ]]'
+printf 'tests=^spec/\n' >"$CONF/config"
+out="$(test_changes "$trbase" "$trref")"
+check "a project tests= pattern replaces the default" '[[ "$out" == *"no changes to existing tests"* ]]'
+
 # Path rules.
 CONF="$tmp/conf"; mkdir -p "$CONF"
 printf '# c\nMakefile\ncontracts/*\n*/migrations/*\n' >"$CONF/protected"

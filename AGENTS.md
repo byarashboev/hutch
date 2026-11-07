@@ -126,7 +126,8 @@ Ask these questions together, each with your drafted answer and the reason for i
    out directory, `~/.hutch/state/<name>/out/<task>/`). Read `self-review.md` and the end of `run.jsonl`.
 7. Follow-ups: `hutch say <task> "<message>"` (opencode: after the run ends; Claude Code: during it).
 8. `hutch export <task>`, then `hutch verify <task>`: it checks that every changed path is allowed and not protected,
-   lists added comment lines, and runs `verify.sh` offline.
+   lists added comment lines, names changes to existing tests (deleted files, removed lines, skip markers), and runs
+   `verify.sh` offline. Treat every named test change as a finding to check in the diff.
 9. **Review the diff yourself** (`git -C <repo> diff <base> refs/hutch/<task>`). `verify` passing is not acceptance.
 10. Take the work: create your branch from `refs/hutch/<task>` (or cherry-pick its commits) in the project, then
     continue with the project's normal process (tests that need services, review, pull request).
