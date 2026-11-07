@@ -558,7 +558,8 @@ cmd_smoke() {
   need_models
   if [[ "$AGENT" == opencode ]]; then SANDBOX_CMD=(opencode run --standalone --format json "Reply with exactly: OK")
   else SANDBOX_CMD=(claude -p "Reply with exactly: OK" --output-format json); fi
-  sandbox "$1" -i
+  # stdin closed: with -i and an open pipe (an agent's shell), opencode run waits on stdin forever.
+  sandbox "$1" -i </dev/null
 }
 
 cmd_rm() {
