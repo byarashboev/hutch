@@ -23,8 +23,11 @@ ARG HUTCH_GID=1000
 RUN npm install -g @anthropic-ai/claude-code@2.1.318 && npm cache clean --force
 COPY --from=opencode /usr/local/bin/opencode /usr/local/bin/opencode
 # The agent's home directories are created and owned here: a volume mounted over a missing one is root-owned, and the
-# agents then fail with EACCES. /cache is the default place for a project's persistent cache volume.
-RUN groupadd -o -g "$HUTCH_GID" hutch && useradd -m -o -u "$HUTCH_UID" -g "$HUTCH_GID" -s /bin/bash hutch \
+# agents then fail with EACCES. /cache is the default place for a project's persistent cache volume. The node image's
+# own user is removed first: it holds uid and gid 1000, the usual ids of a Linux desktop user, and would otherwise
+# shadow hutch (id, getpwuid and ~ would resolve to node).
+RUN userdel node && (groupdel node 2>/dev/null || true) \
+ && groupadd -o -g "$HUTCH_GID" hutch && useradd -m -o -u "$HUTCH_UID" -g "$HUTCH_GID" -s /bin/bash hutch \
  && mkdir -p /work /out /task /cache \
     /home/hutch/.local/share/opencode /home/hutch/.local/state /home/hutch/.config/opencode /home/hutch/.cache /home/hutch/.claude \
  && chown hutch /work /out /task /cache && chown -R hutch /home/hutch
