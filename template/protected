@@ -1,5 +1,6 @@
 # Paths the sandbox agent may never change (bash globs, one per line; * also matches /). hutch verify rejects a diff
-# that touches one, unless the pattern is in openable and the task opened it. .hutch/* is always protected.
+# that touches one, unless the pattern is in openable and the task opened it. .hutch/* and every .gitattributes are
+# always protected.
 # Agent instructions and editor settings
 AGENTS.md
 CLAUDE.md

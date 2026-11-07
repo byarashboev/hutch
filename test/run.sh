@@ -53,6 +53,7 @@ printf '# c\nMakefile\ncontracts/*\n*/migrations/*\n' >"$CONF/protected"
 printf 'contracts/*\n' >"$CONF/openable"
 OPENED_FILE="$tmp/opened"; : >"$OPENED_FILE"
 check "always-protected .hutch" 'protected .hutch/config'
+check "every .gitattributes is always protected (git archive obeys export-ignore in any directory)" 'protected .gitattributes && protected test/.gitattributes && protected a/b/.gitattributes'
 check "protected glob" 'protected backend/migrations/0001.sql && protected Makefile'
 check "not protected" '! protected src/a.go'
 check "closed contract is protected" 'protected contracts/api.yaml'

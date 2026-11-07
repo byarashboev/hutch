@@ -162,8 +162,12 @@ patterns() { [[ -f "$1" ]] || return 0; grep -v -e '^[[:space:]]*$' -e '^#' "$1"
 
 # ---- path rules ------------------------------------------------------------------------------------------------
 
-# Paths the agent may never change, whatever the project or task says: the project's hutch config itself.
-ALWAYS_PROTECTED='.hutch/*'
+# Paths the agent may never change, whatever the project or task says: the project's hutch config itself, and every
+# .gitattributes, because verify checks a git archive of the task branch and export-ignore in any directory would
+# hide files from the checks.
+ALWAYS_PROTECTED='.hutch/*
+.gitattributes
+*/.gitattributes'
 
 # opened succeeds when protected pattern $1 is openable in this project and the task's opened file lists it.
 opened() {
@@ -176,7 +180,7 @@ opened() {
 
 protected() {
   local f="$1" p
-  [[ "$f" == $ALWAYS_PROTECTED ]] && return 0
+  while IFS= read -r p; do [[ "$f" == $p ]] && return 0; done <<<"$ALWAYS_PROTECTED"
   while IFS= read -r p; do
     [[ "$f" == $p ]] && ! opened "$p" && return 0
   done < <(patterns "$CONF/protected")
