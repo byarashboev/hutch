@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.svg" width="128" alt="hutch logo"></p>
+
 # hutch
 
 hutch hands one bounded coding task to a cheaper coding agent running in an isolated container, and gives the result
