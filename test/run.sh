@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Unit tests for hutch's project resolution and path rules. No Docker, no network, no model.
-# Checks are single-quoted on purpose: check() evals them later (SC2016, SC2034); path rules match globs (SC2053).
-# shellcheck disable=SC2016,SC2034,SC2053,SC1091
+# Checks are single-quoted on purpose: check() evals them later (SC2016, SC2034); path rules match globs (SC2053);
+# sandbox() is a stub that cmd_run calls (SC2329).
+# shellcheck disable=SC2016,SC2034,SC2053,SC1091,SC2329
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 tmp="$(cd "$(mktemp -d)" && pwd -P)"
@@ -46,6 +47,26 @@ cd "$tmp/My_Repo" || exit 1
 try_resolve
 check "an in-repo config wins over the home config" '[[ "$CONF" == "$tmp/My_Repo/.hutch" && "$NAME" == inrepo ]]'
 rm -rf "$tmp/My_Repo/.hutch"
+
+# Limits and timeouts: config values, environment overrides, defaults, and a refusal of non-numbers.
+LIMCONF="$tmp/limconf"; mkdir -p "$LIMCONF"; printf 'pids=512\nmemory=2g\nrun_timeout=600\n' >"$LIMCONF/config"
+CONF="$LIMCONF"
+check "limit_args reads pids and memory from the config" '[[ "$(limit_args)" == "--pids-limit 512 --memory 2g" ]]'
+check "limit_args takes the environment first" '[[ "$(HUTCH_PIDS=64 HUTCH_MEMORY=1g limit_args)" == "--pids-limit 64 --memory 1g" ]]'
+check "run_timeout reads the config" '[[ "$(run_timeout)" == 600 ]]'
+check "verify_timeout defaults to 1800" '[[ "$(verify_timeout)" == 1800 ]]'
+check "HUTCH_VERIFY_TIMEOUT overrides" '[[ "$(HUTCH_VERIFY_TIMEOUT=5 verify_timeout)" == 5 ]]'
+out="$( (HUTCH_RUN_TIMEOUT=1h run_timeout) 2>&1)"; rc=$?
+check "a timeout that is not whole seconds is refused" '[[ $rc -ne 0 && "$out" == *"whole seconds"* ]]'
+
+# A run that hits its limit: the agent runs under timeout, and exit code 124 is recorded and named.
+STATE="$tmp/state"; mkdir -p "$STATE/work/slow/repo" "$STATE/out/slow"
+MODEL=m SMALL_MODEL=s AGENT=opencode
+sandbox() { printf '%s\n' "${SANDBOX_CMD[*]}" >"$tmp/cmd"; return 124; }
+out="$( (cmd_run slow) 2>&1)"; rc=$?
+check "the opencode agent runs under the run limit" '[[ "$(cat "$tmp/cmd")" == "timeout -k 30 600 opencode run "* ]]'
+check "a timed-out run records 124 and says so" '[[ $rc -eq 124 && "$(cat "$STATE/out/slow/exit.code")" == 124 && "$out" == *"600s limit"* ]]'
+unset -f sandbox
 
 # Path rules.
 CONF="$tmp/conf"; mkdir -p "$CONF"

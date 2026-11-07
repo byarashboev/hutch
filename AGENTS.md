@@ -122,8 +122,8 @@ Ask these questions together, each with your drafted answer and the reason for i
    `concurrency`). A mixed task can run `HUTCH_PHASE=design` on a strong model first (it writes
    `/out/design-notes.md`), then `HUTCH_PHASE=build` with a cheaper kind; add a "Reviewer notes" section to the
    design notes to correct them before the build.
-6. After the run: `exit.code` must be 0 and `run.err` empty (both in the task's out directory, `~/.hutch/state/<name>/
-   out/<task>/`). Read `self-review.md` and the end of `run.jsonl`.
+6. After the run: `exit.code` must be 0 (124 means the run hit `run_timeout`) and `run.err` empty (both in the task's
+   out directory, `~/.hutch/state/<name>/out/<task>/`). Read `self-review.md` and the end of `run.jsonl`.
 7. Follow-ups: `hutch say <task> "<message>"` (opencode: after the run ends; Claude Code: during it).
 8. `hutch export <task>`, then `hutch verify <task>`: it checks that every changed path is allowed and not protected,
    lists added comment lines, and runs `verify.sh` offline.

@@ -237,6 +237,28 @@ cache_args() {
   return 0
 }
 
+# limit_args prints the process and memory limits for every container that runs the agent's code.
+limit_args() {
+  local pids mem
+  pids="${HUTCH_PIDS:-$(conf_get pids)}"; mem="${HUTCH_MEMORY:-$(conf_get memory)}"
+  echo "--pids-limit ${pids:-2048} --memory ${mem:-12g}"
+}
+
+# seconds prints a time limit: environment variable $1, else config key $2, else default $3.
+seconds() {
+  local v="${!1:-}"
+  [[ -n "$v" ]] || v="$(conf_get "$2")"
+  v="${v:-$3}"
+  [[ "$v" =~ ^[0-9]+$ ]] || die "$1 / $2 must be whole seconds, got '$v'"
+  echo "$v"
+}
+run_timeout() { seconds HUTCH_RUN_TIMEOUT run_timeout 3600; }
+verify_timeout() { seconds HUTCH_VERIFY_TIMEOUT verify_timeout 1800; }
+
+# TIMED_OUT is the exit code of coreutils timeout when the limit is reached; the agent and the checks run under it
+# inside the container, so a stuck run or check ends instead of holding the sandbox and the model quota.
+TIMED_OUT=124
+
 # sandbox runs SANDBOX_CMD in the project image: internal network behind the allowlist proxy, no capabilities, only
 # the task's files mounted. Extra docker flags come in "$@".
 sandbox() {
@@ -267,12 +289,10 @@ sandbox() {
   [[ -f "$CONF/checklist.md" ]] && extra+=(-v "$CONF/checklist.md:/task/project-checklist.md:ro")
   [[ -f "$CONF/protected" ]] && extra+=(-v "$CONF/protected:/task/protected.txt:ro")
   [[ -f "$dir/opened" ]] && extra+=(-v "$dir/opened:/task/opened.txt:ro")
-  local pids mem
-  pids="${HUTCH_PIDS:-$(conf_get pids)}"; mem="${HUTCH_MEMORY:-$(conf_get memory)}"
-  # shellcheck disable=SC2046 # cache_args prints whole docker flags
+  # shellcheck disable=SC2046 # cache_args and limit_args print whole docker flags
   ANTHROPIC_AUTH_TOKEN="$key" OPENCODE_API_KEY="$key" docker run --rm "$@" \
     --network "$NET_INTERNAL" --cap-drop ALL --security-opt no-new-privileges \
-    --pids-limit "${pids:-2048}" --memory "${mem:-12g}" --tmpfs /tmp:exec,size=4g \
+    $(limit_args) --tmpfs /tmp:exec,size=4g \
     -v "$dir/repo:/work" -v "$dir/brief.md:/task/brief.md:ro" -v "$CONF/primer.md:/task/primer.md:ro" \
     -v "${HUTCH_DIR}/rules/checklist.md:/task/checklist.md:ro" -v "$(out_dir "$task"):/out" \
     ${extra[@]+"${extra[@]}"} $(cache_args) "${agent_args[@]}" -e HUTCH_PROBE_URL="$BASE_URL" \
@@ -280,11 +300,12 @@ sandbox() {
     "$PROJECT_IMAGE" "${SANDBOX_CMD[@]}"
 }
 
-# offline runs a command in the project image with no network at all.
+# offline runs a command in the project image with no network at all, under the same limits as the agent: the
+# checks run the agent's code.
 offline() {
   # shellcheck disable=SC2046
   docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:exec,size=4g \
-    $(cache_args) "$@"
+    $(limit_args) $(cache_args) "$@"
 }
 
 # ---- commands --------------------------------------------------------------------------------------------------
@@ -413,9 +434,10 @@ cmd_run() {
   need_task "$1"
   need_models
   need_pro_kind "$1"
-  local task="$1" out steer tailpid msg
+  local task="$1" out steer tailpid msg limit
   out="$(out_dir "$task")"; steer="$out/steer.jsonl"
   msg="$(kickoff)"
+  limit="$(run_timeout)"
   /bin/rm -f "$out/tail.pid" "$out/exit.code"
   # A later phase keeps the earlier phase's log.
   [[ -s "$out/run.jsonl" ]] && /bin/mv -f "$out/run.jsonl" "$out/run.$(date +%Y%m%d%H%M%S).jsonl"
@@ -424,15 +446,17 @@ cmd_run() {
   if [[ "$AGENT" == opencode ]]; then
     # opencode run takes one message and exits when the agent stops; hutch say continues the session afterwards.
     : >"$steer"
-    SANDBOX_CMD=(opencode run --standalone --auto --format json --title "$task" "$msg")
+    SANDBOX_CMD=(timeout -k 30 "$limit" opencode run --standalone --auto --format json --title "$task" "$msg")
     local rc=0
     sandbox "$task" >"$out/run.jsonl" 2>"$out/run.err" || rc=$?
     echo "$rc" >"$out/exit.code"
     echo "log: $out/run.jsonl (sandbox exit $rc)"
+    [[ $rc -eq $TIMED_OUT ]] && echo "hutch: the run hit its ${limit}s limit (HUTCH_RUN_TIMEOUT / run_timeout)" >&2
     return "$rc"
   fi
   user_line "$msg" >"$steer"
-  SANDBOX_CMD=(claude -p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions)
+  SANDBOX_CMD=(timeout -k 30 "$limit" claude -p --input-format stream-json --output-format stream-json --verbose
+    --dangerously-skip-permissions)
   (
     set +o pipefail
     sh -c 'echo $$ >"$1"; exec tail -n +1 -f "$2"' _ "$out/tail.pid" "$steer" |
@@ -449,6 +473,8 @@ cmd_run() {
   wait "$job" || true
   /bin/rm -f "$out/tail.pid"
   echo "log: $out/run.jsonl (sandbox exit $(cat "$out/exit.code" 2>/dev/null || echo unknown))"
+  [[ "$(cat "$out/exit.code" 2>/dev/null)" == "$TIMED_OUT" ]] &&
+    echo "hutch: the run hit its ${limit}s limit (HUTCH_RUN_TIMEOUT / run_timeout)" >&2
   [[ "$(cat "$out/exit.code" 2>/dev/null)" == 0 ]]
 }
 
@@ -460,7 +486,7 @@ cmd_say() {
   if [[ "$AGENT" == opencode ]]; then
     [[ -f "$out/exit.code" ]] || die "$1 has no finished run; opencode takes a follow-up only after the run stops"
     /bin/rm -f "$out/exit.code"
-    SANDBOX_CMD=(opencode run --standalone --auto --format json --continue "$2")
+    SANDBOX_CMD=(timeout -k 30 "$(run_timeout)" opencode run --standalone --auto --format json --continue "$2")
     local rc=0
     sandbox "$1" >>"$out/run.jsonl" 2>>"$out/run.err" || rc=$?
     echo "$rc" >"$out/exit.code"
@@ -522,10 +548,13 @@ cmd_verify() {
   git -C "$REPO" archive "$ref" | tar -x -C "$tree"
   printf '%s\n' "$files" >"$out/changed.txt"
   echo "== checks (offline container)"
-  if ! offline -v "$tree:/work" -v "$out/changed.txt:/task/changed.txt:ro" -v "$CONF/verify.sh:/task/verify.sh:ro" \
-    "$PROJECT_IMAGE" bash -euo pipefail /task/verify.sh /task/changed.txt 2>&1 | tee "$out/verify.log"; then
-    die "checks failed: $out/verify.log"
-  fi
+  local limit rc=0
+  limit="$(verify_timeout)"
+  offline -v "$tree:/work" -v "$out/changed.txt:/task/changed.txt:ro" -v "$CONF/verify.sh:/task/verify.sh:ro" \
+    "$PROJECT_IMAGE" timeout -k 10 "$limit" bash -euo pipefail /task/verify.sh /task/changed.txt 2>&1 |
+    tee "$out/verify.log" || rc=$?
+  [[ $rc -eq $TIMED_OUT ]] && die "checks hit their ${limit}s limit (HUTCH_VERIFY_TIMEOUT / verify_timeout): $out/verify.log"
+  [[ $rc -eq 0 ]] || die "checks failed: $out/verify.log"
   echo "verify passed: now review the diff yourself: git -C $REPO diff $base $ref"
 }
 

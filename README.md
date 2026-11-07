@@ -119,7 +119,8 @@ computer, for shared repositories). hutch looks in that order.
 
 Environment: `HUTCH_KIND`, `HUTCH_MODEL`, `HUTCH_SMALL_MODEL`, `HUTCH_PHASE` (`design`/`build`), `HUTCH_AGENT`,
 `HUTCH_PROVIDER`, `HUTCH_BRANCH`, `HUTCH_OPENED`, `HUTCH_PROJECT` (use a home config from outside the repository),
-`HUTCH_HOME` (default `~/.hutch`), `HUTCH_API_KEY`, `HUTCH_MEMORY`, `HUTCH_PIDS`, `HUTCH_EFFORT`, `HUTCH_IDLE_S`.
+`HUTCH_HOME` (default `~/.hutch`), `HUTCH_API_KEY`, `HUTCH_MEMORY`, `HUTCH_PIDS`, `HUTCH_RUN_TIMEOUT`,
+`HUTCH_VERIFY_TIMEOUT`, `HUTCH_EFFORT`, `HUTCH_IDLE_S`.
 
 ## Agent skill
 

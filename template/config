@@ -6,6 +6,9 @@ base_branch=main
 manifests=
 # Container path of a persistent cache volume shared by this project's tasks (for example a build cache). Optional.
 cache_mount=
-# Sandbox limits.
+# Sandbox limits, for the agent's run and for hutch verify's checks (they run the agent's code).
 memory=12g
 pids=2048
+# Wall-clock limits in seconds: a run (and each hutch say follow-up), and the checks of hutch verify.
+run_timeout=3600
+verify_timeout=1800
