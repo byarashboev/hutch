@@ -18,6 +18,29 @@ source "$here/hutch"
 set +e
 setup_provider
 
+# Providers: the repository's providers/*.conf, a user's ~/.hutch/providers/*.conf, and refusal of unsafe values.
+check "the default provider is OpenCode Go from providers/opencode.conf" '[[ "$PROVIDER" == opencode && "$UPSTREAM" == https://opencode.ai && "$KEY_ITEM" == opencode-go && "$CLAUDE_BASE" == /inference/go/anthropic && "$OPENCODE_PROVIDER" == opencode-go && "$MODELS_FILE" == "$here/models/opencode.tsv" ]]'
+check "deepseek runs only the Claude Code agent" '! (HUTCH_PROVIDER=deepseek; setup_provider) 2>/dev/null && (HUTCH_PROVIDER=deepseek HUTCH_AGENT=claude; setup_provider; [[ "$COMPACT_WINDOW" == 786432 ]])'
+mkdir -p "$HUTCH_HOME/providers"
+printf 'upstream=https://api.example.com\nkey_item=myrouter\nclaude_base=/anthropic\npaths=/anthropic/v1/\nmodels=myrouter.tsv\n' >"$HUTCH_HOME/providers/myrouter.conf"
+check "a provider in ~/.hutch/providers is found, with its model table next to it" '(HUTCH_PROVIDER=myrouter HUTCH_AGENT=claude; setup_provider; [[ "$UPSTREAM" == https://api.example.com && "$KEY_ITEM" == myrouter && "$MODELS_FILE" == "$HUTCH_HOME/providers/myrouter.tsv" ]])'
+out="$( (HUTCH_PROVIDER=myrouter; setup_provider) 2>&1)"; rc=$?
+check "the opencode agent needs a provider with opencode_provider" '[[ $rc -ne 0 && "$out" == *opencode_provider* ]]'
+out="$( (HUTCH_PROVIDER=nope; setup_provider) 2>&1)"; rc=$?
+check "an unknown provider is refused" '[[ $rc -ne 0 && "$out" == *"no provider"* ]]'
+printf 'upstream=http://api.example.com\nkey_item=k\nclaude_base=/a\npaths=/a/\n' >"$HUTCH_HOME/providers/plain.conf"
+out="$( (HUTCH_PROVIDER=plain HUTCH_AGENT=claude; setup_provider) 2>&1)"; rc=$?
+check "a provider upstream must be https://host" '[[ $rc -ne 0 && "$out" == *"https://host"* ]]'
+printf 'upstream=https://api.example.com\nkey_item=k\nclaude_base=/a\npaths=/a/;deny\n' >"$HUTCH_HOME/providers/inject.conf"
+out="$( (HUTCH_PROVIDER=inject HUTCH_AGENT=claude; setup_provider) 2>&1)"; rc=$?
+check "a provider path with other characters is refused" '[[ $rc -ne 0 && "$out" == *paths* ]]'
+
+# The gate's nginx template: one location per allowed path, the key only as a variable, everything else refused.
+out="$(gate_conf)"
+check "the gate forwards each allowed path to the upstream over verified TLS" '[[ "$out" == *"location ^~ /zen/go/v1/ {"* && "$out" == *"location ^~ /inference/go/anthropic/v1/ {"* && "$out" == *"proxy_pass https://opencode.ai;"* && "$out" == *"proxy_ssl_verify on;"* ]]'
+check "the gate sets the key from its own environment" '[[ "$out" == *"Authorization \"Bearer \${HUTCH_KEY}\""* && "$out" == *"x-api-key \"\${HUTCH_KEY}\""* ]]'
+check "the gate refuses every other path" '[[ "$out" == *"location / {"*"return 403"* ]]'
+
 # A repository with a worktree, both resolving to the main checkout.
 git init -q -b main "$tmp/My_Repo"
 git -C "$tmp/My_Repo" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init

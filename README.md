@@ -14,10 +14,11 @@ back to your main agent (or to you) for review. The sandbox agent writes the cod
 verifies.
 
 - **Agents:** the [opencode](https://opencode.ai) CLI (default) or Claude Code.
-- **Providers:** OpenCode Go (default) or the DeepSeek API. The model is chosen by the kind of work (`HUTCH_KIND`).
-- **Isolation:** the container has no capabilities, sees only its own clone of the repository, and reaches only the
-  model API through an allowlist proxy. Results come back as a git bundle; the host never runs git inside the
-  agent's clone.
+- **Providers:** OpenCode Go (default), the DeepSeek API, or any Anthropic-format API you describe in
+  `~/.hutch/providers/<name>.conf` (Claude Code agent). The model is chosen by the kind of work (`HUTCH_KIND`).
+- **Isolation:** the container has no capabilities, sees only its own clone of the repository, and has no route out.
+  Its only peer is a per-run gate that holds the provider key and forwards only the provider's API paths, so the
+  sandbox never holds the key. Results come back as a git bundle; the host never runs git inside the agent's clone.
 - **Any project:** each project describes its toolchain, checks and protected paths in a small config directory.
 
 ## Why
@@ -68,15 +69,24 @@ you          review the diff, take the commits
 git clone <this repository> ~/hutch
 ln -s ~/hutch/hutch ~/.local/bin/hutch          # any directory on PATH
 security add-generic-password -a "$USER" -s opencode-go -w   # macOS: prompts for the OpenCode Go key
-hutch build                                      # base image, proxy, networks
+hutch build                                      # base image, gate image, networks
 hutch status
 ```
 
 On Linux store the key with `secret-tool store --label='hutch opencode-go' service opencode-go`, or export
 `HUTCH_API_KEY`. For DeepSeek, use the service name `deepseek-api` and `HUTCH_PROVIDER=deepseek HUTCH_AGENT=claude`.
 
-Updates: `git -C ~/hutch pull`, then `hutch build` if `image/` or `proxy/` changed. Every project uses the same
+Updates: `git -C ~/hutch pull`, then `hutch build` if `image/` changed or the gate image was updated. Every project uses the same
 checkout, so a fix reaches all of them at once.
+
+## Providers
+
+A provider is a small `key=value` file: [providers/opencode.conf](providers/opencode.conf) (OpenCode Go) and
+[providers/deepseek.conf](providers/deepseek.conf) ship with hutch. To use another Anthropic-format API (an
+aggregator, a self-hosted gateway), add `~/.hutch/providers/<name>.conf` with `upstream=https://host`, `key_item=`,
+`paths=` (the path prefixes the gate may forward), `claude_base=` and `models=<name>.tsv` (a model table next to it),
+store the key under `key_item`, and run with `HUTCH_PROVIDER=<name> HUTCH_AGENT=claude`. The opencode agent works with
+the providers opencode ships (`opencode_provider=`), because the sandbox cannot download others.
 
 ## Set up a project
 
@@ -139,8 +149,9 @@ its own items in its `checklist.md`; nothing project-specific goes into this rep
 ## Limits
 
 - The model provider sees the code you send it. Never put production data or credentials into a task.
-- The key is inside the container for the length of a run, so the agent could use it; the proxy allows only the model
-  hosts, which bounds where it can be sent.
+- The sandbox never holds the provider key, but it can use it through the gate for the provider's API paths during a
+  run (that is how the agent works), so a run can spend quota up to `run_timeout`. The gate's access log is kept as
+  `gate.log` in the task's out directory.
 - A Docker container shares the kernel of Docker's VM with your other containers. For a microVM boundary, see
   [brig](https://github.com/brig-sh/brig).
 - `verify` passing means the paths and the project's offline checks are fine, not that the change is correct.

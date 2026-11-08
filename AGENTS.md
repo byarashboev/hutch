@@ -29,19 +29,21 @@ Once per computer. Ask the user before each step that installs or stores somethi
 3. **Provider and agent.** Ask the user which they use. The defaults are the opencode CLI (`HUTCH_AGENT=opencode`)
    on the OpenCode Go subscription (`HUTCH_PROVIDER=opencode`). The alternatives are Claude Code as the sandbox agent
    (`HUTCH_AGENT=claude`) and the paid DeepSeek API (`HUTCH_PROVIDER=deepseek`, which needs `HUTCH_AGENT=claude`).
-   Edit `models/<provider>.tsv` if their plan has other models or limits.
+   Any other Anthropic-format API is a provider file in `~/.hutch/providers/<name>.conf` (README, Providers). Edit
+   the provider's model table if their plan has other models or limits.
 4. **API key.** The user stores it; never ask them to paste a key into the chat, and never print it. Give them the
    command to run themselves:
    - macOS: `security add-generic-password -a "$USER" -s opencode-go -w` (it prompts for the key; use `deepseek-api`
      as the service name for DeepSeek).
    - Linux: `secret-tool store --label='hutch opencode-go' service opencode-go`.
    - Elsewhere: export `HUTCH_API_KEY` in the shell that runs hutch.
-5. **Images**: `hutch build` builds `hutch-base`, `hutch-proxy` and the two Docker networks (plus the project image
-   when run inside a project that is set up).
+5. **Images**: `hutch build` builds `hutch-base`, pulls the pinned gate image and creates the two Docker networks
+   (plus the project image when run inside a project that is set up).
 6. Run `hutch status` again; every machine line must say ok.
 
-The proxy lets the sandbox reach only the hosts in `proxy/allow` (the model APIs). Do not add hosts there to make a
-task easier: package registries and Git hosts stay closed on purpose.
+The sandbox has no route out; its only peer is a gate started for each sandbox command. The gate holds the key and
+forwards only the provider's `paths=` to its `upstream`. Do not widen a provider's paths or point it at another host
+to make a task easier: package registries and Git hosts stay closed on purpose.
 
 ## Project setup
 
@@ -147,7 +149,7 @@ Ask these questions together, each with your drafted answer and the reason for i
 
 ## Maintaining hutch
 
-- Update: `git -C <this directory> pull`, then `hutch build` when `image/` or `proxy/` changed. A pull during a running
+- Update: `git -C <this directory> pull`, then `hutch build` when `image/` or `GATE_IMAGE` changed. A pull during a running
   task is safe: the script is parsed completely before it runs.
 - Changing the script: keep it compatible with bash 3.2 (macOS), run `shellcheck hutch test/*.sh`, `test/run.sh` and,
   with Docker, `test/e2e.sh` (CI runs all three), and keep this file, the README and `skills/hutch/SKILL.md` in step

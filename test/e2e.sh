@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end test of hutch with Docker and no model: hutch builds the images and a throwaway project, the test plays
 # the sandbox agent by committing into the task's workspace, then hutch export and hutch verify must accept a clean
-# change and reject each kind of bad one. The isolation probe runs with a dummy key: only the model host may answer.
-# It builds hutch-base, hutch-proxy and the networks under their usual names, like hutch build does.
+# change and reject each kind of bad one. The isolation probe runs with a dummy key: only the gate may answer, and
+# only for the provider's paths. It builds hutch-base, pulls the gate and creates the networks, like hutch build does.
 # Checks are single-quoted on purpose: check() evals them later (SC2016, SC2034).
 # shellcheck disable=SC2016,SC2034
 set -euo pipefail
@@ -42,7 +42,7 @@ printf 'cd /work\nnode --test\n' >"$conf/verify.sh"
 printf '# e2e primer\n' >"$conf/primer.md"
 rm -f "$conf/checklist.md"
 "$hutch" build >"$tmp/build.log" 2>&1 || { tail -30 "$tmp/build.log"; exit 1; }
-pass "hutch build (base, proxy, project image)"
+pass "hutch build (base image, gate, project image)"
 
 printf 'src/*\ntest/*\n' >"$tmp/allow"
 printf '# brief\nAdd mul.\n' >"$tmp/brief.md"
@@ -83,9 +83,12 @@ rc=0; out="$(HUTCH_VERIFY_TIMEOUT=5 "$hutch" verify slow 2>&1)" || rc=$?
 check "a hanging check stops at the verify limit" '[[ $rc -ne 0 && "$out" == *"5s limit"* ]]'
 
 out="$(HUTCH_API_KEY=dummy HUTCH_KIND=script "$hutch" isolation clean 2>&1 </dev/null)" || true
-check "isolation: GitHub, npm and DNS are blocked" '[[ "$out" == *"blocked proxy https://github.com"* && "$out" == *"blocked proxy https://registry.npmjs.org"* && "$out" == *"blocked dns github.com"* ]]'
+check "isolation: GitHub, npm, the Anthropic API and DNS are blocked" '[[ "$out" == *"blocked direct https://github.com"* && "$out" == *"blocked direct https://registry.npmjs.org"* && "$out" == *"blocked direct https://api.anthropic.com"* && "$out" == *"blocked dns github.com"* ]]'
+check "isolation: the gate refuses other paths" '[[ "$out" == *"other gate path http=403"* ]]'
+check "isolation: the provider key is not in the sandbox" '[[ "$out" == *"provider key: not in the sandbox"* ]]'
 check "isolation: no capabilities and no credential directories" '[[ "$out" == *"CapEff:"*"0000000000000000"* && "$out" != *PRESENT* ]]'
-check "isolation: the model host answers through the proxy" '[[ "$out" =~ model\ host\ via\ proxy\ http=[1-5][0-9][0-9] ]]'
+check "isolation: the model API answers through the gate" '[[ "$out" =~ model\ API\ via\ gate\ http=[1-5][0-9][0-9] ]]'
+check "isolation: the gate is removed afterwards and its log is kept" '[[ -z "$(docker ps -q --filter name=hutch-gate-e2e-demo)" && -s "$HUTCH_HOME/state/e2e-demo/out/clean/gate.log" ]]'
 
 out="$("$hutch" report clean 2>&1)" || true
 check "report shows the verify outcome, the commit and the test changes" '[[ "$out" == *"verify: passed"* && "$out" == *"agent: clean"* && "$out" == *"extended test/math.test.js"* ]]'

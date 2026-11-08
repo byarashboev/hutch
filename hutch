@@ -2,7 +2,7 @@
 # hutch: a coding agent (opencode or Claude Code) does one bounded task in an isolated container; the host agent briefs and verifies.
 #   hutch status                     machine and project state; start here (exit 3: project not set up, 4: machine not set up)
 #   hutch init [--in-repo]           create this project's config from the template (~/.hutch/projects/<name>, or <repo>/.hutch)
-#   hutch build                      build the base, proxy and project images and create the networks
+#   hutch build                      build the base and project images, pull the gate, create the networks
 #   hutch new <task> <allow> <brief> clone the base branch (or $HUTCH_BRANCH) into a task workspace
 #   hutch run <task>                 run the agent on the primer and brief (log in the task's out directory)
 #   hutch say <task> <message>       follow-up message (opencode: after the run ends; claude: during the run)
@@ -22,10 +22,13 @@ set -euo pipefail
 HUTCH_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 HUTCH_HOME="${HUTCH_HOME:-${HOME}/.hutch}"
 BASE_IMAGE=hutch-base:latest
-PROXY_IMAGE=hutch-proxy:latest
+# The gate: nginx, unprivileged, pinned by digest. It holds the provider key for one sandbox command and forwards only
+# the provider's API paths; the sandbox has no other way out.
+GATE_IMAGE=nginxinc/nginx-unprivileged:1.27.5-alpine@sha256:65e3e85dbaed8ba248841d9d58a899b6197106c23cb0ff1a132b7bfe0547e4c0
 NET_INTERNAL=hutch-internal
 NET_EGRESS=hutch-egress
-PROXY=hutch-proxy
+# The key the agents see: a placeholder, replaced by the gate.
+PLACEHOLDER_KEY=hutch-gate
 # Kinds in the model tables that count as strong models for the pro-paths rule.
 PRO_KINDS="design concurrency"
 
@@ -33,24 +36,45 @@ die() { echo "hutch: $*" >&2; exit 1; }
 
 # ---- provider, agent and model -------------------------------------------------------------------------------
 
+# kv_get prints the value of key $2 from key=value file $1 (the file is read, never executed; the first line wins).
+kv_get() {
+  awk -v k="$2" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$1"
+}
+
+# setup_provider reads providers/<name>.conf, or ~/.hutch/providers/<name>.conf first, for HUTCH_PROVIDER (default
+# opencode), and checks the values that end up in the gate's nginx configuration.
 setup_provider() {
+  local file p
   PROVIDER="${HUTCH_PROVIDER:-opencode}"
-  case "$PROVIDER" in
-    opencode)
-      BASE_URL=https://opencode.ai/inference/go/anthropic  # OpenCode Go's Anthropic-format endpoint (Claude Code agent)
-      KEY_ITEM="${HUTCH_KEY_ITEM:-opencode-go}"
-      COMPACT_WINDOW="${HUTCH_COMPACT_WINDOW:-}" ;;
-    deepseek)
-      BASE_URL=https://api.deepseek.com/anthropic
-      KEY_ITEM="${HUTCH_KEY_ITEM:-deepseek-api}"
-      COMPACT_WINDOW="${HUTCH_COMPACT_WINDOW:-786432}" ;;
-    *) die "HUTCH_PROVIDER must be opencode or deepseek" ;;
-  esac
-  MODELS_FILE="${HUTCH_MODELS:-${HUTCH_DIR}/models/${PROVIDER}.tsv}"
+  [[ "$PROVIDER" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "HUTCH_PROVIDER must match [a-z0-9][a-z0-9-]*"
+  file="${HUTCH_HOME}/providers/${PROVIDER}.conf"
+  [[ -f "$file" ]] || file="${HUTCH_DIR}/providers/${PROVIDER}.conf"
+  [[ -f "$file" ]] || die "no provider '$PROVIDER': add ${HUTCH_HOME}/providers/${PROVIDER}.conf (see ${HUTCH_DIR}/providers)"
+  UPSTREAM="$(kv_get "$file" upstream)"
+  [[ "$UPSTREAM" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] ||
+    die "$file: upstream must be https://host[:port] with no path, got '$UPSTREAM'"
+  KEY_ITEM="${HUTCH_KEY_ITEM:-$(kv_get "$file" key_item)}"
+  [[ -n "$KEY_ITEM" ]] || die "$file: key_item is empty"
+  PATHS="$(kv_get "$file" paths)"
+  [[ -n "$PATHS" ]] || die "$file: paths is empty"
+  for p in $PATHS; do [[ "$p" =~ ^/[A-Za-z0-9._/-]*$ ]] || die "$file: paths must be /path prefixes, got '$p'"; done
+  CLAUDE_BASE="$(kv_get "$file" claude_base)"
+  OPENCODE_BASE="$(kv_get "$file" opencode_base)"
+  OPENCODE_PROVIDER="$(kv_get "$file" opencode_provider)"
+  for p in "$CLAUDE_BASE" "$OPENCODE_BASE"; do
+    [[ -z "$p" || "$p" =~ ^/[A-Za-z0-9._/-]*$ ]] || die "$file: claude_base and opencode_base must be /paths"
+  done
+  [[ -z "$OPENCODE_PROVIDER" || "$OPENCODE_PROVIDER" =~ ^[a-z0-9-]+$ ]] || die "$file: opencode_provider is not an id"
+  COMPACT_WINDOW="${HUTCH_COMPACT_WINDOW:-$(kv_get "$file" compact_window)}"
+  p="$(kv_get "$file" models)"
+  [[ -z "$p" || "$p" == /* ]] || p="$(dirname "$file")/$p"
+  [[ -n "$p" ]] || p="${HUTCH_DIR}/models/${PROVIDER}.tsv"
+  MODELS_FILE="${HUTCH_MODELS:-$(cd "$(dirname "$p")" 2>/dev/null && pwd)/$(basename "$p")}"
   AGENT="${HUTCH_AGENT:-opencode}"
   case "$AGENT" in
-    opencode) [[ "$PROVIDER" == opencode ]] || die "HUTCH_AGENT=opencode runs only on HUTCH_PROVIDER=opencode" ;;
-    claude) ;;
+    opencode) [[ -n "$OPENCODE_PROVIDER" && -n "$OPENCODE_BASE" ]] ||
+      die "provider $PROVIDER has no opencode_provider / opencode_base: use HUTCH_AGENT=claude" ;;
+    claude) [[ -n "$CLAUDE_BASE" ]] || die "provider $PROVIDER has no claude_base: use HUTCH_AGENT=opencode" ;;
     *) die "HUTCH_AGENT must be opencode or claude" ;;
   esac
   KIND="${HUTCH_KIND:-}"
@@ -101,10 +125,8 @@ have_key() {
 
 # ---- project ---------------------------------------------------------------------------------------------------
 
-# conf_get prints the value of key $1 from the project config (key=value lines; the file is read, never executed).
-conf_get() {
-  awk -v k="$1" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$CONF/config"
-}
+# conf_get prints the value of key $1 from the project config.
+conf_get() { kv_get "$CONF/config" "$1"; }
 
 slug() { echo "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-\n' '-'; }
 
@@ -257,12 +279,64 @@ need_docker() { docker info >/dev/null 2>&1 || die "docker is not running"; }
 
 need_image() { docker image inspect "$1" >/dev/null 2>&1 || die "image $1 is missing; run hutch build"; }
 
-proxy_up() {
-  if [[ "$(docker inspect -f '{{.State.Running}}' "$PROXY" 2>/dev/null)" == true ]]; then return; fi
-  docker rm -f "$PROXY" >/dev/null 2>&1 || true
-  docker run -d --name "$PROXY" --network "$NET_EGRESS" --cap-drop ALL \
-    --security-opt no-new-privileges --restart unless-stopped "$PROXY_IMAGE" >/dev/null
-  docker network connect "$NET_INTERNAL" "$PROXY"
+# gate_conf prints the gate's nginx template: one location per allowed path prefix, forwarded to the upstream over
+# verified TLS with the key set from the gate's own environment (${HUTCH_KEY}, filled in by the image's envsubst at
+# start, so the key is never written to disk), and 403 for every other path.
+gate_conf() {
+  local host="${UPSTREAM#https://}" p
+  printf '%s\n' \
+    'log_format hutch_gate '"'"'$time_iso8601 $request_method $request_uri -> $status upstream=$upstream_status'"'"';' \
+    'server {' \
+    '  listen 8080;' \
+    '  access_log /dev/stdout hutch_gate;' \
+    '  client_max_body_size 64m;' \
+    '  location = /hutch-gate-health { access_log off; return 200 "ok\n"; }'
+  for p in $PATHS; do
+    printf '%s\n' \
+      "  location ^~ $p {" \
+      "    proxy_pass $UPSTREAM;" \
+      "    proxy_ssl_server_name on;" \
+      "    proxy_ssl_name ${host%%:*};" \
+      "    proxy_ssl_verify on;" \
+      "    proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;" \
+      "    proxy_set_header Host $host;" \
+      '    proxy_set_header Authorization "Bearer ${HUTCH_KEY}";' \
+      '    proxy_set_header x-api-key "${HUTCH_KEY}";' \
+      "    proxy_http_version 1.1;" \
+      "    proxy_buffering off;" \
+      "    proxy_request_buffering off;" \
+      "    proxy_read_timeout 900s;" \
+      "  }"
+  done
+  printf '%s\n' '  location / { return 403 "hutch gate: path not allowed\n"; }' '}'
+}
+
+# gate_up starts gate $1 for one sandbox command with the provider key, writes its template to file $2, and waits
+# until it answers. gate_down (also run on exit) appends its access log to file $3 and removes it.
+gate_up() {
+  local name="$1" conf="$2" key _
+  key="$(api_key)"
+  gate_conf >"$conf"
+  GATE_NAME="$name"; GATE_LOG="$3"
+  trap gate_down EXIT
+  HUTCH_KEY="$key" docker run -d --rm --name "$name" --network "$NET_EGRESS" --cap-drop ALL \
+    --security-opt no-new-privileges --read-only --tmpfs /tmp:mode=1777 --tmpfs /etc/nginx/conf.d:mode=1777 \
+    --memory 256m --pids-limit 64 -e HUTCH_KEY -v "$conf:/etc/nginx/templates/default.conf.template:ro" \
+    "$GATE_IMAGE" >/dev/null
+  docker network connect "$NET_INTERNAL" "$name"
+  for _ in $(seq 1 50); do
+    docker exec "$name" wget -q -O /dev/null http://127.0.0.1:8080/hutch-gate-health 2>/dev/null && return 0
+    sleep 0.2
+  done
+  docker logs "$name" >&2 2>&1 || true
+  die "the gate $name did not start (log above)"
+}
+
+gate_down() {
+  [[ -n "${GATE_NAME:-}" ]] || return 0
+  docker logs "$GATE_NAME" >>"$GATE_LOG" 2>&1 || true
+  docker rm -f "$GATE_NAME" >/dev/null 2>&1 || true
+  GATE_NAME=""
 }
 
 cache_args() {
@@ -293,26 +367,45 @@ verify_timeout() { seconds HUTCH_VERIFY_TIMEOUT verify_timeout 1800; }
 # inside the container, so a stuck run or check ends instead of holding the sandbox and the model quota.
 TIMED_OUT=124
 
-# sandbox runs SANDBOX_CMD in the project image: internal network behind the allowlist proxy, no capabilities, only
-# the task's files mounted. Extra docker flags come in "$@".
+# opencode_json prints the opencode configuration for one run: the provider's base URL points at the gate.
+opencode_json() {
+  printf '%s\n' '{' \
+    '  "$schema": "https://opencode.ai/config.json",' \
+    '  "update": "disable",' \
+    '  "share": "disabled",' \
+    "  \"model\": \"$OPENCODE_PROVIDER/$MODEL\"," \
+    "  \"small_model\": \"$OPENCODE_PROVIDER/$SMALL_MODEL\"," \
+    "  \"agent\": { \"general\": { \"model\": \"$OPENCODE_PROVIDER/$MODEL\" }, \"explore\": { \"model\": \"$OPENCODE_PROVIDER/$SMALL_MODEL\" } }," \
+    "  \"provider\": { \"$OPENCODE_PROVIDER\": { \"options\": { \"baseURL\": \"$1\", \"apiKey\": \"$PLACEHOLDER_KEY\" } } }" \
+    '}'
+}
+
+# sandbox runs SANDBOX_CMD in the project image: internal network with no route out, the gate as the only peer (it
+# holds the key), no capabilities, only the task's files mounted. Extra docker flags come in "$@".
 sandbox() {
   local task="$1"; shift
-  local dir key agent_args extra
-  dir="$(task_dir "$task")"
+  local dir out gate url probe agent_args extra
+  dir="$(task_dir "$task")"; out="$(out_dir "$task")"
   [[ -f "$CONF/primer.md" ]] || die "missing $CONF/primer.md"
   need_image "$PROJECT_IMAGE"
-  key="$(api_key)"
-  proxy_up
+  need_image "$GATE_IMAGE"
+  # Model names go into opencode.json; brackets stay allowed for names such as deepseek-v4-pro[1m].
+  local model_re='^[][A-Za-z0-9._:/-]+$'
+  [[ "$MODEL" =~ $model_re && "$SMALL_MODEL" =~ $model_re ]] || die "model names may hold only letters, digits and ._:/-[]"
+  gate="hutch-gate-${NAME}-${task}-$$"; url="http://${gate}:8080"
+  gate_up "$gate" "$dir/gate.conf.template" "$out/gate.log"
+  if [[ -n "$CLAUDE_BASE" ]]; then probe="$url$CLAUDE_BASE/v1/messages"; else probe="$url$OPENCODE_BASE/chat/completions"; fi
   if [[ "$AGENT" == opencode ]]; then
     # Sessions live with the task, so a follow-up (hutch say) continues the same session.
     mkdir -p "$dir/oc-data"
+    opencode_json "$url$OPENCODE_BASE" >"$dir/opencode.json"
     agent_args=(-v "$dir/oc-data:/home/hutch/.local/share/opencode"
-      -v "${HUTCH_DIR}/opencode/opencode.json:/home/hutch/.config/opencode/opencode.json:ro"
+      -v "$dir/opencode.json:/home/hutch/.config/opencode/opencode.json:ro"
       -v "${HUTCH_DIR}/rules/sandbox.md:/home/hutch/.config/opencode/AGENTS.md:ro"
-      -e OPENCODE_API_KEY -e OC_MODEL="opencode-go/$MODEL" -e OC_SMALL_MODEL="opencode-go/$SMALL_MODEL")
+      -e OPENCODE_API_KEY="$PLACEHOLDER_KEY")
   else
     agent_args=(-v "${CLAUDE_VOLUME}:/home/hutch/.claude" -v "${HUTCH_DIR}/rules/sandbox.md:/home/hutch/.claude/CLAUDE.md:ro"
-      -e ANTHROPIC_AUTH_TOKEN -e ANTHROPIC_BASE_URL="$BASE_URL"
+      -e ANTHROPIC_AUTH_TOKEN="$PLACEHOLDER_KEY" -e ANTHROPIC_BASE_URL="$url$CLAUDE_BASE"
       -e ANTHROPIC_MODEL="$MODEL" -e ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL"
       -e ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" -e ANTHROPIC_DEFAULT_HAIKU_MODEL="$SMALL_MODEL"
       -e CLAUDE_CODE_SUBAGENT_MODEL="$SMALL_MODEL" -e CLAUDE_CODE_EFFORT_LEVEL="${HUTCH_EFFORT:-max}"
@@ -323,15 +416,17 @@ sandbox() {
   [[ -f "$CONF/checklist.md" ]] && extra+=(-v "$CONF/checklist.md:/task/project-checklist.md:ro")
   [[ -f "$CONF/protected" ]] && extra+=(-v "$CONF/protected:/task/protected.txt:ro")
   [[ -f "$dir/opened" ]] && extra+=(-v "$dir/opened:/task/opened.txt:ro")
+  local rc=0
   # shellcheck disable=SC2046 # cache_args and limit_args print whole docker flags
-  ANTHROPIC_AUTH_TOKEN="$key" OPENCODE_API_KEY="$key" docker run --rm "$@" \
+  docker run --rm "$@" \
     --network "$NET_INTERNAL" --cap-drop ALL --security-opt no-new-privileges \
     $(limit_args) --tmpfs /tmp:exec,size=4g \
     -v "$dir/repo:/work" -v "$dir/brief.md:/task/brief.md:ro" -v "$CONF/primer.md:/task/primer.md:ro" \
-    -v "${HUTCH_DIR}/rules/checklist.md:/task/checklist.md:ro" -v "$(out_dir "$task"):/out" \
-    ${extra[@]+"${extra[@]}"} $(cache_args) "${agent_args[@]}" -e HUTCH_PROBE_URL="$BASE_URL" \
-    -e HTTPS_PROXY="http://${PROXY}:8888" -e HTTP_PROXY="http://${PROXY}:8888" \
-    "$PROJECT_IMAGE" "${SANDBOX_CMD[@]}"
+    -v "${HUTCH_DIR}/rules/checklist.md:/task/checklist.md:ro" -v "$out:/out" \
+    ${extra[@]+"${extra[@]}"} $(cache_args) "${agent_args[@]}" -e HUTCH_PROBE_URL="$probe" -e HUTCH_GATE="$url" \
+    "$PROJECT_IMAGE" "${SANDBOX_CMD[@]}" || rc=$?
+  gate_down
+  return "$rc"
 }
 
 # offline runs a command in the project image with no network at all, under the same limits as the agent: the
@@ -349,10 +444,11 @@ line() { printf '  %-22s %s\n' "$1" "$2"; }
 cmd_status() {
   local rc=0 ok
   echo "hutch ${HUTCH_DIR} ($(git -C "$HUTCH_DIR" rev-parse --short HEAD 2>/dev/null || echo 'not a git checkout'))"
+  echo "provider: $PROVIDER ($UPSTREAM), agent: $AGENT"
   echo "machine:"
   if docker info >/dev/null 2>&1; then line docker ok; else line docker "MISSING (start Docker)"; rc=4; fi
   if have_key; then line "key $KEY_ITEM" ok; else line "key $KEY_ITEM" "MISSING (AGENTS.md, Machine setup)"; rc=4; fi
-  for ok in "$BASE_IMAGE" "$PROXY_IMAGE"; do
+  for ok in "$BASE_IMAGE" "$GATE_IMAGE"; do
     if docker image inspect "$ok" >/dev/null 2>&1; then line "$ok" ok; else line "$ok" "MISSING (hutch build)"; rc=4; fi
   done
   command -v hutch >/dev/null || echo "  hutch is not on PATH (optional: ln -s ${HUTCH_DIR}/hutch ~/.local/bin/hutch)"
@@ -387,12 +483,14 @@ cmd_init() {
 cmd_build() {
   need_docker
   docker build -t "$BASE_IMAGE" --build-arg HUTCH_UID="$(id -u)" --build-arg HUTCH_GID="$(id -g)" "${HUTCH_DIR}/image"
-  docker build -t "$PROXY_IMAGE" "${HUTCH_DIR}/proxy"
+  docker pull -q "$GATE_IMAGE" >/dev/null
   docker network inspect "$NET_INTERNAL" >/dev/null 2>&1 || docker network create --internal "$NET_INTERNAL" >/dev/null
   docker network inspect "$NET_EGRESS" >/dev/null 2>&1 || docker network create "$NET_EGRESS" >/dev/null
+  # The allowlist proxy of earlier versions held no key but is no longer used: the gate replaced it.
+  docker rm -f hutch-proxy >/dev/null 2>&1 || true
   CONF=""
   try_resolve || true
-  if [[ -z "$CONF" ]]; then echo "base and proxy built; no project here is set up, so no project image"; return; fi
+  if [[ -z "$CONF" ]]; then echo "base image and gate ready; no project here is set up, so no project image"; return; fi
   local re files branch
   BUILD_CTX="$(mktemp -d)"
   trap 'rm -rf "$BUILD_CTX"' EXIT
@@ -684,7 +782,7 @@ cmd_report() {
     echo "## To review"
     echo
     local f
-    for f in self-review.md design-notes.md verify.log run.err; do
+    for f in self-review.md design-notes.md verify.log run.err gate.log; do
       [[ -s "$out/$f" ]] && echo "- $out/$f"
     done
     echo "- git -C $REPO diff $base $ref"
@@ -698,11 +796,12 @@ cmd_isolation() {
   SANDBOX_CMD=(bash -c '
     probe() { if timeout 8 bash -c "$2" >/dev/null 2>&1; then echo "REACHABLE $1"; else echo "blocked $1"; fi; }
     echo "== egress"
-    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$HUTCH_PROBE_URL/v1/messages" -X POST -d "{}")
-    echo "model host via proxy http=$code"
-    for u in https://github.com https://proxy.golang.org https://registry.npmjs.org https://pypi.org https://api.anthropic.com; do
-      probe "proxy $u" "curl -sf --max-time 6 $u"; done
-    probe "direct https 1.1.1.1" "curl -sf --noproxy \"*\" --max-time 6 https://1.1.1.1"
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$HUTCH_PROBE_URL" -X POST -d "{}")
+    echo "model API via gate http=$code"
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 6 "$HUTCH_GATE/")
+    echo "other gate path http=$code"
+    for u in https://github.com https://proxy.golang.org https://registry.npmjs.org https://pypi.org https://api.anthropic.com https://1.1.1.1; do
+      probe "direct $u" "curl -sf --max-time 6 $u"; done
     probe "dns github.com" "getent hosts github.com"
     gw=$(ip route 2>/dev/null | awk "/default/{print \$3}"); gw=${gw:-172.17.0.1}
     for p in 22 80 2375 2376 3306 4222 5432 6379 6380 8222 27017; do
@@ -714,7 +813,8 @@ cmd_isolation() {
     for d in .ssh .kube .aws .config/gh .docker .pgpass .netrc; do [ -e "$HOME/$d" ] && echo "PRESENT ~/$d"; done
     ls /var/run/docker.sock 2>/dev/null && echo "PRESENT docker.sock"
     echo "== env names"; env | cut -d= -f1 | sort | tr "\n" " "; echo
-    echo "token length ${#ANTHROPIC_AUTH_TOKEN} ${#OPENCODE_API_KEY}"
+    if [ "${ANTHROPIC_AUTH_TOKEN:-hutch-gate}${OPENCODE_API_KEY:-hutch-gate}" = hutch-gatehutch-gate ]; then
+      echo "provider key: not in the sandbox (placeholder only)"; else echo "PRESENT provider key"; fi
     echo "== capabilities"; grep CapEff /proc/self/status
   ')
   sandbox "$1" -i

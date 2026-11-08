@@ -6,7 +6,7 @@ description: Hand one bounded coding task to a cheaper coding agent (opencode or
 # hutch
 
 hutch runs a cheaper agent in a container that has no capabilities, sees only its own clone of the repository and
-reaches only the model API through an allowlist proxy. **The sandbox agent writes the code. You write the brief and
+has no route out except a per-run gate to the model API; the gate holds the key, the sandbox never does. **The sandbox agent writes the code. You write the brief and
 verify the result.**
 
 Source and full instructions: https://github.com/byarashboev/hutch (its `AGENTS.md` is the authoritative guide; this
