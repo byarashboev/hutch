@@ -9,6 +9,9 @@ cache_mount=
 # Sandbox limits, for the agent's run and for hutch verify's checks (they run the agent's code).
 memory=12g
 pids=2048
+# Docker runtime for the sandbox, verify's checks and export, for example runsc (gVisor: a user-space kernel between
+# the agent's code and the host's). Empty: Docker's default. It must be installed (AGENTS.md, gVisor).
+runtime=
 # Test files, an ERE over repository paths; empty uses hutch's default (test/, __tests__/, *.test.*, *_test.go,
 # test_*.py and similar). hutch verify names deleted test files, lines removed from existing tests and new skip or
 # focus markers. tests_policy=report only names them; append-only also fails verify.

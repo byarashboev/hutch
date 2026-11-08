@@ -137,6 +137,36 @@ check "run_usage sums reported cost and agent time" '[[ "$out" == *"cost reporte
 out="$(run_usage "$tmp/nothing-here")"
 check "run_usage with no logs says so" '[[ "$out" == *"no run logs"* ]]'
 
+# The container runtime (gVisor's runsc, for example): config, environment override, refusal of other values, and the
+# flag on the containers that run the agent's code.
+CONF="$tmp/rtconf"; mkdir -p "$CONF"; printf 'runtime=runsc\n' >"$CONF/config"
+setup_runtime
+check "runtime= in the config sets the runtime" '[[ "$RUNTIME" == runsc ]]'
+check "HUTCH_RUNTIME overrides the config" '(HUTCH_RUNTIME=kata; setup_runtime; [[ "$RUNTIME" == kata ]])'
+out="$( (HUTCH_RUNTIME="runsc --privileged"; setup_runtime) 2>&1)"; rc=$?
+check "a runtime that is not a plain name is refused" '[[ $rc -ne 0 && "$out" == *"runtime name"* ]]'
+docker() { printf '%s\n' "$@" >"$tmp/dargs"; }
+offline img true
+check "verify's checks run under the runtime" '[[ "$(grep -A1 -x -- --runtime "$tmp/dargs" | tail -1)" == runsc ]]'
+RUNTIME=""; offline img true
+check "no runtime set: Docker's default, no --runtime flag" '! grep -qx -- --runtime "$tmp/dargs"'
+unset -f docker
+
+# hutch ls: one line per task with its run state, verify status, host-side commits and model.
+STATE="$tmp/lsstate"; NAME=lsproj; REPO="$TR"
+for t in finished live fresh; do mkdir -p "$STATE/work/$t/repo" "$STATE/out/$t"; echo "$trbase" >"$STATE/work/$t/base"; done
+echo 0 >"$STATE/out/finished/exit.code"; echo passed >"$STATE/out/finished/verify.status"
+echo "2026-11-08T00:00:00Z agent=opencode provider=opencode kind=build model=glm-5 small=x phase=" >"$STATE/out/finished/models.log"
+git -C "$TR" update-ref refs/hutch/finished "$trref"
+: >"$STATE/out/live/run.jsonl"
+docker() { [[ "$1" == ps ]] && echo live; }
+# hutch itself runs with errexit and pipefail; so does this call.
+out="$(set -eo pipefail; cmd_ls)"
+unset -f docker
+check "ls shows a finished task's exit code, verify status, commits and model" '[[ "$out" =~ finished\ +[0-9]+s\ +exit\ 0\ +passed\ +1\ +glm-5 ]]'
+check "ls shows a task whose gate is up as running" '[[ "$out" =~ live\ +[0-9]+s\ +running\ +-\ +- ]]'
+check "ls shows a task that has not run" '[[ "$out" =~ fresh\ +[0-9]+s\ +not\ run ]]'
+
 # Path rules.
 CONF="$tmp/conf"; mkdir -p "$CONF"
 printf '# c\nMakefile\ncontracts/*\n*/migrations/*\n' >"$CONF/protected"

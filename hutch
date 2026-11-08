@@ -10,6 +10,7 @@
 #   hutch export <task>              write the task branch as a git bundle
 #   hutch verify <task>              fetch the bundle on the host, check paths, run the project's checks offline
 #   hutch report <task>              the task's model, usage, commits, verify status and test changes (report.md)
+#   hutch ls                         this project's tasks: age, run state, verify status, commits on the host, model
 #   hutch rm <task>                  remove a task workspace, its output and its ref
 #   hutch smoke|isolation <task>     one-line model call | egress, mount and capability probes
 #   hutch models                     the model chosen per HUTCH_KIND and the skipped models
@@ -277,6 +278,9 @@ need_pro_kind() {
 
 need_docker() { docker info >/dev/null 2>&1 || die "docker is not running"; }
 
+# docker_runtimes prints the runtimes the Docker daemon knows, one per line.
+docker_runtimes() { docker info --format '{{range $k, $v := .Runtimes}}{{println $k}}{{end}}' 2>/dev/null; }
+
 need_image() { docker image inspect "$1" >/dev/null 2>&1 || die "image $1 is missing; run hutch build"; }
 
 # gate_conf prints the gate's nginx template: one location per allowed path prefix, forwarded to the upstream over
@@ -311,8 +315,9 @@ gate_conf() {
   printf '%s\n' '  location / { return 403 "hutch gate: path not allowed\n"; }' '}'
 }
 
-# gate_up starts gate $1 for one sandbox command with the provider key, writes its template to file $2, and waits
-# until it answers. gate_down (also run on exit) appends its access log to file $3 and removes it.
+# gate_up starts gate $1 for one sandbox command of task $4 with the provider key, writes its template to file $2, and
+# waits until it answers. gate_down (also run on exit) appends its access log to file $3 and removes it. The labels
+# let hutch ls see which tasks are running.
 gate_up() {
   local name="$1" conf="$2" key _
   key="$(api_key)"
@@ -321,7 +326,7 @@ gate_up() {
   trap gate_down EXIT
   HUTCH_KEY="$key" docker run -d --rm --name "$name" --network "$NET_EGRESS" --cap-drop ALL \
     --security-opt no-new-privileges --read-only --tmpfs /tmp:mode=1777 --tmpfs /etc/nginx/conf.d:mode=1777 \
-    --memory 256m --pids-limit 64 -e HUTCH_KEY -v "$conf:/etc/nginx/templates/default.conf.template:ro" \
+    --memory 256m --pids-limit 64 --label "hutch.project=$NAME" --label "hutch.task=$4" -e HUTCH_KEY -v "$conf:/etc/nginx/templates/default.conf.template:ro" \
     "$GATE_IMAGE" >/dev/null
   docker network connect "$NET_INTERNAL" "$name"
   for _ in $(seq 1 50); do
@@ -350,6 +355,16 @@ limit_args() {
   local pids mem
   pids="${HUTCH_PIDS:-$(conf_get pids)}"; mem="${HUTCH_MEMORY:-$(conf_get memory)}"
   echo "--pids-limit ${pids:-2048} --memory ${mem:-12g}"
+}
+
+# setup_runtime sets RUNTIME from HUTCH_RUNTIME or the config's runtime= (runsc: gVisor, a user-space kernel between
+# the agent's code and the host's); empty is Docker's default runtime. Every container that runs the agent's code or
+# reads its repository passes it; the gate does not (it runs only nginx). It is checked here, outside any command
+# substitution, so a bad value stops hutch instead of silently falling back to the default runtime.
+setup_runtime() {
+  RUNTIME="${HUTCH_RUNTIME:-$(conf_get runtime)}"
+  [[ -z "$RUNTIME" || "$RUNTIME" =~ ^[A-Za-z0-9._-]+$ ]] ||
+    die "HUTCH_RUNTIME / runtime must be a Docker runtime name, got '$RUNTIME'"
 }
 
 # seconds prints a time limit: environment variable $1, else config key $2, else default $3.
@@ -393,7 +408,7 @@ sandbox() {
   local model_re='^[][A-Za-z0-9._:/-]+$'
   [[ "$MODEL" =~ $model_re && "$SMALL_MODEL" =~ $model_re ]] || die "model names may hold only letters, digits and ._:/-[]"
   gate="hutch-gate-${NAME}-${task}-$$"; url="http://${gate}:8080"
-  gate_up "$gate" "$dir/gate.conf.template" "$out/gate.log"
+  gate_up "$gate" "$dir/gate.conf.template" "$out/gate.log" "$task"
   if [[ -n "$CLAUDE_BASE" ]]; then probe="$url$CLAUDE_BASE/v1/messages"; else probe="$url$OPENCODE_BASE/chat/completions"; fi
   if [[ "$AGENT" == opencode ]]; then
     # Sessions live with the task, so a follow-up (hutch say) continues the same session.
@@ -420,7 +435,7 @@ sandbox() {
   # shellcheck disable=SC2046 # cache_args and limit_args print whole docker flags
   docker run --rm "$@" \
     --network "$NET_INTERNAL" --cap-drop ALL --security-opt no-new-privileges \
-    $(limit_args) --tmpfs /tmp:exec,size=4g \
+    ${RUNTIME:+--runtime "$RUNTIME"} $(limit_args) --tmpfs /tmp:exec,size=4g \
     -v "$dir/repo:/work" -v "$dir/brief.md:/task/brief.md:ro" -v "$CONF/primer.md:/task/primer.md:ro" \
     -v "${HUTCH_DIR}/rules/checklist.md:/task/checklist.md:ro" -v "$out:/out" \
     ${extra[@]+"${extra[@]}"} $(cache_args) "${agent_args[@]}" -e HUTCH_PROBE_URL="$probe" -e HUTCH_GATE="$url" \
@@ -434,7 +449,7 @@ sandbox() {
 offline() {
   # shellcheck disable=SC2046
   docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:exec,size=4g \
-    $(limit_args) $(cache_args) "$@"
+    ${RUNTIME:+--runtime "$RUNTIME"} $(limit_args) $(cache_args) "$@"
 }
 
 # ---- commands --------------------------------------------------------------------------------------------------
@@ -464,6 +479,11 @@ cmd_status() {
   line config "$CONF"
   if docker image inspect "$PROJECT_IMAGE" >/dev/null 2>&1; then line image "$PROJECT_IMAGE ok"
   else line image "$PROJECT_IMAGE MISSING (hutch build)"; [[ $rc -eq 0 ]] && rc=4; fi
+  setup_runtime
+  if [[ -n "$RUNTIME" ]]; then
+    if docker_runtimes | grep -qx -- "$RUNTIME"; then line runtime "$RUNTIME ok"
+    else line runtime "$RUNTIME MISSING (not in docker info; AGENTS.md, gVisor)"; [[ $rc -eq 0 ]] && rc=4; fi
+  fi
   line tasks "$(ls "${STATE}/work" 2>/dev/null | tr '\n' ' ')"
   return "$rc"
 }
@@ -643,7 +663,7 @@ cmd_export() {
   local dir; dir="$(task_dir "$1")"
   need_image "$PROJECT_IMAGE"
   # git runs in a network-less container, so hooks or config the agent wrote never run on the host.
-  docker run --rm --network none --cap-drop ALL -v "$dir/repo:/work:ro" -v "$(out_dir "$1"):/out" \
+  docker run --rm --network none --cap-drop ALL ${RUNTIME:+--runtime "$RUNTIME"} -v "$dir/repo:/work:ro" -v "$(out_dir "$1"):/out" \
     -e GIT_CONFIG_NOSYSTEM=1 "$PROJECT_IMAGE" \
     git -c core.hooksPath=/dev/null -c safe.directory=/work bundle create "/out/$1.bundle" "$(cat "$dir/base")..hutch/$1"
 }
@@ -816,6 +836,7 @@ cmd_isolation() {
     if [ "${ANTHROPIC_AUTH_TOKEN:-hutch-gate}${OPENCODE_API_KEY:-hutch-gate}" = hutch-gatehutch-gate ]; then
       echo "provider key: not in the sandbox (placeholder only)"; else echo "PRESENT provider key"; fi
     echo "== capabilities"; grep CapEff /proc/self/status
+    echo "== kernel"; echo "kernel $(uname -r)"
   ')
   sandbox "$1" -i
 }
@@ -827,6 +848,39 @@ cmd_smoke() {
   else SANDBOX_CMD=(claude -p "Reply with exactly: OK" --output-format json); fi
   # stdin closed: with -i and an open pipe (an agent's shell), opencode run waits on stdin forever.
   sandbox "$1" -i </dev/null
+}
+
+# age prints how long ago file $1 changed: 45s, 12m, 3h or 2d.
+age() {
+  local s; s=$(( $(date +%s) - $(date -r "$1" +%s) ))
+  if [[ $s -lt 60 ]]; then echo "${s}s"; elif [[ $s -lt 3600 ]]; then echo "$((s / 60))m"
+  elif [[ $s -lt 86400 ]]; then echo "$((s / 3600))h"; else echo "$((s / 86400))d"; fi
+}
+
+# cmd_ls prints one line per task. A run is "running" while its gate container is up (every sandbox command has
+# one); otherwise it shows the sandbox's exit code. Commits are counted on the host's refs/hutch/<task> (after hutch
+# verify): like hutch report, it never runs git in the agent's clone.
+cmd_ls() {
+  local dir task out running run verify commits model
+  [[ -d "${STATE}/work" ]] || { echo "no tasks (hutch new)"; return 0; }
+  running="$(docker ps --filter "label=hutch.project=$NAME" --format '{{.Label "hutch.task"}}' 2>/dev/null || true)"
+  printf '%-24s %-5s %-12s %-28s %-8s %s\n' TASK AGE RUN VERIFY COMMITS MODEL
+  for dir in "${STATE}"/work/*/; do
+    task="$(basename "$dir")"
+    [[ -f "$dir/base" ]] || continue
+    out="$(out_dir "$task")"
+    if grep -qx -- "$task" <<<"$running"; then run=running
+    elif [[ -f "$out/exit.code" ]]; then run="exit $(cat "$out/exit.code")"
+    elif [[ -s "$out/run.jsonl" ]]; then run=stopped
+    else run="not run"; fi
+    verify="$(head -1 "$out/verify.status" 2>/dev/null || echo '-')"
+    commits=-
+    git -C "$REPO" rev-parse --verify --quiet "refs/hutch/$task" >/dev/null &&
+      commits="$(git -C "$REPO" rev-list --count "$(cat "$dir/base")..refs/hutch/$task")"
+    model=-
+    [[ -s "$out/models.log" ]] && model="$(tail -1 "$out/models.log" | sed -n 's/.* model=\([^ ]*\).*/\1/p')"
+    printf '%-24s %-5s %-12s %-28s %-8s %s\n' "$task" "$(age "$dir/base")" "$run" "$verify" "$commits" "${model:--}"
+  done
 }
 
 cmd_rm() {
@@ -858,6 +912,7 @@ main() {
     build) cmd_build ;;
     *)
       need_project
+      setup_runtime
       case "$cmd" in
         new) [[ $# -eq 3 ]] || die "usage: hutch new <task> <allow-file> <brief-file>"; cmd_new "$@" ;;
         run) cmd_run "${1:-}" ;;
@@ -866,6 +921,7 @@ main() {
         export) cmd_export "${1:-}" ;;
         verify) cmd_verify "${1:-}" ;;
         rm) cmd_rm "${1:-}" ;;
+        ls) cmd_ls ;;
         isolation) cmd_isolation "${1:-}" ;;
         smoke) cmd_smoke "${1:-}" ;;
         report) cmd_report "${1:-}" ;;

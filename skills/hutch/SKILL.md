@@ -40,7 +40,7 @@ themselves.
 8. `hutch report <task>`: model, usage, commits, verify status and test changes on one page.
 9. **Review the diff yourself:** `git -C <repo> diff <base> refs/hutch/<task>`. A passing `verify` is not acceptance.
 10. Take the work from `refs/hutch/<task>` (branch or cherry-pick) and continue with the project's normal process.
-11. `hutch rm <task>` when merged or abandoned.
+11. `hutch rm <task>` when merged or abandoned; `hutch ls` lists the project's tasks and their state.
 
 ## Verification rules
 

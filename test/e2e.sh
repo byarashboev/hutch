@@ -3,6 +3,7 @@
 # the sandbox agent by committing into the task's workspace, then hutch export and hutch verify must accept a clean
 # change and reject each kind of bad one. The isolation probe runs with a dummy key: only the gate may answer, and
 # only for the provider's paths. It builds hutch-base, pulls the gate and creates the networks, like hutch build does.
+# With HUTCH_RUNTIME set (CI sets runsc), every sandbox and check runs under that runtime.
 # Checks are single-quoted on purpose: check() evals them later (SC2016, SC2034).
 # shellcheck disable=SC2016,SC2034
 set -euo pipefail
@@ -88,7 +89,14 @@ check "isolation: the gate refuses other paths" '[[ "$out" == *"other gate path 
 check "isolation: the provider key is not in the sandbox" '[[ "$out" == *"provider key: not in the sandbox"* ]]'
 check "isolation: no capabilities and no credential directories" '[[ "$out" == *"CapEff:"*"0000000000000000"* && "$out" != *PRESENT* ]]'
 check "isolation: the model API answers through the gate" '[[ "$out" =~ model\ API\ via\ gate\ http=[1-5][0-9][0-9] ]]'
+if [[ -n "${HUTCH_RUNTIME:-}" ]]; then
+  # gVisor reports its own kernel version, so on a Linux host the sandbox's kernel differs from the host's (CI).
+  check "isolation: the sandbox runs under $HUTCH_RUNTIME, not the host kernel" '[[ "$out" == *"kernel "* && "$out" != *"kernel $(uname -r)"* ]]'
+fi
 check "isolation: the gate is removed afterwards and its log is kept" '[[ -z "$(docker ps -q --filter name=hutch-gate-e2e-demo)" && -s "$HUTCH_HOME/state/e2e-demo/out/clean/gate.log" ]]'
+
+out="$("$hutch" ls 2>&1)" || true
+check "ls lists every task with its verify status" '[[ "$out" =~ clean\ +[0-9]+[smh]\ +[^\ ]+.*passed && "$out" =~ broken\ .*failed:\ checks\ failed && "$out" == *slow* ]]'
 
 out="$("$hutch" report clean 2>&1)" || true
 check "report shows the verify outcome, the commit and the test changes" '[[ "$out" == *"verify: passed"* && "$out" == *"agent: clean"* && "$out" == *"extended test/math.test.js"* ]]'

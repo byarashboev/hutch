@@ -124,13 +124,14 @@ computer, for shared repositories). hutch looks in that order.
 | `hutch shell <task>` | interactive agent session in the sandbox |
 | `hutch export <task>` / `hutch verify <task>` | bundle the result / check it on the host |
 | `hutch report <task>` | model, tokens, time, commits, verify status and test changes; kept as `report.md` |
+| `hutch ls` | the project's tasks: age, running or exit code, verify status, commits, model |
 | `hutch rm <task>` | remove the task |
 | `hutch smoke <task>` / `hutch isolation <task>` | model call / isolation probes |
 | `hutch models` | model per kind, skipped models |
 
 Environment: `HUTCH_KIND`, `HUTCH_MODEL`, `HUTCH_SMALL_MODEL`, `HUTCH_PHASE` (`design`/`build`), `HUTCH_AGENT`,
 `HUTCH_PROVIDER`, `HUTCH_BRANCH`, `HUTCH_OPENED`, `HUTCH_PROJECT` (use a home config from outside the repository),
-`HUTCH_HOME` (default `~/.hutch`), `HUTCH_API_KEY`, `HUTCH_MEMORY`, `HUTCH_PIDS`, `HUTCH_RUN_TIMEOUT`,
+`HUTCH_HOME` (default `~/.hutch`), `HUTCH_API_KEY`, `HUTCH_MEMORY`, `HUTCH_PIDS`, `HUTCH_RUNTIME`, `HUTCH_RUN_TIMEOUT`,
 `HUTCH_VERIFY_TIMEOUT`, `HUTCH_EFFORT`, `HUTCH_IDLE_S`.
 
 ## Agent skill
@@ -161,7 +162,9 @@ its own items in its `checklist.md`; nothing project-specific goes into this rep
 - The sandbox never holds the provider key, but it can use it through the gate for the provider's API paths during a
   run (that is how the agent works), so a run can spend quota up to `run_timeout`. The gate's access log is kept as
   `gate.log` in the task's out directory.
-- A Docker container shares the kernel of Docker's VM with your other containers. For a microVM boundary, see
+- A Docker container shares the kernel of Docker's VM with your other containers. `runtime=runsc` in the project
+  config (or `HUTCH_RUNTIME=runsc`) runs the sandbox and the checks under [gVisor](https://gvisor.dev), a user-space
+  kernel, on Linux hosts where it is installed; CI runs the end-to-end test under it. For a microVM boundary, see
   [brig](https://github.com/brig-sh/brig).
 - `verify` passing means the paths and the project's offline checks are fine, not that the change is correct.
   Review the diff.

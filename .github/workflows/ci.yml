@@ -34,3 +34,21 @@ jobs:
       - uses: actions/checkout@v4
       - name: end-to-end
         run: bash test/e2e.sh
+
+  e2e-gvisor:
+    # The same end-to-end test with every sandbox and check under gVisor (runtime=runsc).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: install gVisor
+        run: |
+          curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" |
+            sudo tee /etc/apt/sources.list.d/gvisor.list
+          sudo apt-get update -q && sudo apt-get install -y -q runsc
+          sudo runsc install
+          sudo systemctl restart docker
+          docker info --format '{{range $k, $v := .Runtimes}}{{println $k}}{{end}}' | grep -x runsc
+      - name: end-to-end under gVisor
+        run: HUTCH_RUNTIME=runsc bash test/e2e.sh

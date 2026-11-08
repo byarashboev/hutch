@@ -40,6 +40,10 @@ Once per computer. Ask the user before each step that installs or stores somethi
 5. **Images**: `hutch build` builds `hutch-base`, pulls the pinned gate image and creates the two Docker networks
    (plus the project image when run inside a project that is set up).
 6. Run `hutch status` again; every machine line must say ok.
+7. **gVisor (optional, Linux).** For a stronger boundary than a container, offer gVisor: install `runsc`
+   (https://gvisor.dev/docs/user_guide/install/), run `sudo runsc install` and restart Docker, then set `runtime=runsc`
+   in the project config (or `HUTCH_RUNTIME=runsc`). `hutch status` shows a runtime line, and `hutch isolation`
+   reports the sandbox's kernel, which under gVisor differs from the host's. Docker Desktop on macOS does not ship it.
 
 The sandbox has no route out; its only peer is a gate started for each sandbox command. The gate holds the key and
 forwards only the provider's `paths=` to its `upstream`. Do not widen a provider's paths or point it at another host
@@ -84,7 +88,7 @@ Ask these questions together, each with your drafted answer and the reason for i
 1. `hutch init` (home config) or `hutch init --in-repo`. It copies `template/` and records the name and repository.
 2. Fill in every file:
    - `config`: `base_branch`, `manifests` (an ERE over repository paths), `cache_mount` if the toolchain has a
-     build cache worth keeping between tasks.
+     build cache worth keeping between tasks, `runtime` if gVisor is installed.
    - `Dockerfile`: the toolchain, pinned; warm the caches from `src/` (the manifests); end offline and as `USER hutch`.
    - `verify.sh`: the checks per changed area. Every command must work with no network. It must fail on a failing
      check.
@@ -135,7 +139,8 @@ Ask these questions together, each with your drafted answer and the reason for i
 10. **Review the diff yourself** (`git -C <repo> diff <base> refs/hutch/<task>`). `verify` passing is not acceptance.
 11. Take the work: create your branch from `refs/hutch/<task>` (or cherry-pick its commits) in the project, then
     continue with the project's normal process (tests that need services, review, pull request).
-12. `hutch rm <task>` when it is merged or abandoned.
+12. `hutch rm <task>` when it is merged or abandoned. `hutch ls` lists the project's tasks with their state, so
+    nothing is left behind.
 
 ### Verification rules
 
@@ -153,5 +158,6 @@ Ask these questions together, each with your drafted answer and the reason for i
   task is safe: the script is parsed completely before it runs.
 - Changing the script: keep it compatible with bash 3.2 (macOS), run `shellcheck hutch test/*.sh`, `test/run.sh` and,
   with Docker, `test/e2e.sh` (CI runs all three), and keep this file, the README and `skills/hutch/SKILL.md` in step
-  with it. The repository is also a Claude Code plugin (`.claude-plugin/`); `claude plugin validate .` checks it.
+  with it. The repository is also a Claude Code plugin (`.claude-plugin/`); `claude plugin validate .` checks
+  it.
 - Project-specific knowledge never goes into this repository: it belongs in the project's config directory.
