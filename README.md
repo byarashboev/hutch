@@ -136,9 +136,18 @@ Environment: `HUTCH_KIND`, `HUTCH_MODEL`, `HUTCH_SMALL_MODEL`, `HUTCH_PHASE` (`d
 ## Agent skill
 
 [skills/hutch/SKILL.md](skills/hutch/SKILL.md) is a short [Agent Skill](https://agentskills.io) that teaches a host
-agent the hutch loop: check `hutch status`, write the brief, run, verify, review the diff. Install it for Claude Code
-with `mkdir -p ~/.claude/skills && ln -s ~/hutch/skills/hutch ~/.claude/skills/hutch`; other agents read the same
-`SKILL.md` from their own skills directory. [AGENTS.md](AGENTS.md) stays the full guide.
+agent the hutch loop: check `hutch status`, write the brief, run, verify, review the diff. This repository is also a
+Claude Code plugin marketplace, so in Claude Code it installs with:
+
+```
+/plugin marketplace add byarashboev/hutch
+/plugin install hutch@hutch
+```
+
+The plugin carries only the skill: install the `hutch` CLI and Docker as above. To follow your own checkout instead,
+link it: `mkdir -p ~/.claude/skills && ln -s ~/hutch/skills/hutch ~/.claude/skills/hutch` (use one or the other, not
+both). Other agents read the same `SKILL.md` from their own skills directory. [AGENTS.md](AGENTS.md) stays the full
+guide.
 
 ## Universal rules
 

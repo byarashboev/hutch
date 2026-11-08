@@ -153,5 +153,5 @@ Ask these questions together, each with your drafted answer and the reason for i
   task is safe: the script is parsed completely before it runs.
 - Changing the script: keep it compatible with bash 3.2 (macOS), run `shellcheck hutch test/*.sh`, `test/run.sh` and,
   with Docker, `test/e2e.sh` (CI runs all three), and keep this file, the README and `skills/hutch/SKILL.md` in step
-  with it.
+  with it. The repository is also a Claude Code plugin (`.claude-plugin/`); `claude plugin validate .` checks it.
 - Project-specific knowledge never goes into this repository: it belongs in the project's config directory.

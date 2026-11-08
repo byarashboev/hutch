@@ -1,0 +1,9 @@
+{
+  "name": "hutch",
+  "description": "Delegate one bounded coding task to a cheaper agent in an isolated Docker sandbox, then verify the result on the host. Needs the hutch CLI and Docker.",
+  "author": { "name": "Yarashboev Bahodir", "url": "https://github.com/byarashboev" },
+  "homepage": "https://github.com/byarashboev/hutch",
+  "repository": "https://github.com/byarashboev/hutch",
+  "license": "Apache-2.0",
+  "keywords": ["sandbox", "docker", "delegation", "coding-agent", "opencode", "verification"]
+}
