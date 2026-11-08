@@ -317,7 +317,8 @@ gate_conf() {
 
 # gate_up starts gate $1 for one sandbox command of task $4 with the provider key, writes its template to file $2, and
 # waits until it answers. gate_down (also run on exit) appends its access log to file $3 and removes it. The labels
-# let hutch ls see which tasks are running.
+# let hutch ls see which tasks are running. It sets GATE_IP, the gate's address on the internal network: the sandbox
+# uses the address, not the name, because Docker's embedded DNS does not answer inside gVisor (runtime=runsc).
 gate_up() {
   local name="$1" conf="$2" key _
   key="$(api_key)"
@@ -326,9 +327,11 @@ gate_up() {
   trap gate_down EXIT
   HUTCH_KEY="$key" docker run -d --rm --name "$name" --network "$NET_EGRESS" --cap-drop ALL \
     --security-opt no-new-privileges --read-only --tmpfs /tmp:mode=1777 --tmpfs /etc/nginx/conf.d:mode=1777 \
-    --memory 256m --pids-limit 64 --label "hutch.project=$NAME" --label "hutch.task=$4" -e HUTCH_KEY -v "$conf:/etc/nginx/templates/default.conf.template:ro" \
-    "$GATE_IMAGE" >/dev/null
+    --memory 256m --pids-limit 64 --label "hutch.project=$NAME" --label "hutch.task=$4" -e HUTCH_KEY \
+    -v "$conf:/etc/nginx/templates/default.conf.template:ro" "$GATE_IMAGE" >/dev/null
   docker network connect "$NET_INTERNAL" "$name"
+  GATE_IP="$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NET_INTERNAL\").IPAddress}}" "$name")"
+  [[ "$GATE_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "the gate $name has no address on $NET_INTERNAL ('$GATE_IP')"
   for _ in $(seq 1 50); do
     docker exec "$name" wget -q -O /dev/null http://127.0.0.1:8080/hutch-gate-health 2>/dev/null && return 0
     sleep 0.2
@@ -407,8 +410,9 @@ sandbox() {
   # Model names go into opencode.json; brackets stay allowed for names such as deepseek-v4-pro[1m].
   local model_re='^[][A-Za-z0-9._:/-]+$'
   [[ "$MODEL" =~ $model_re && "$SMALL_MODEL" =~ $model_re ]] || die "model names may hold only letters, digits and ._:/-[]"
-  gate="hutch-gate-${NAME}-${task}-$$"; url="http://${gate}:8080"
+  gate="hutch-gate-${NAME}-${task}-$$"
   gate_up "$gate" "$dir/gate.conf.template" "$out/gate.log" "$task"
+  url="http://${GATE_IP}:8080"
   if [[ -n "$CLAUDE_BASE" ]]; then probe="$url$CLAUDE_BASE/v1/messages"; else probe="$url$OPENCODE_BASE/chat/completions"; fi
   if [[ "$AGENT" == opencode ]]; then
     # Sessions live with the task, so a follow-up (hutch say) continues the same session.
@@ -816,9 +820,9 @@ cmd_isolation() {
   SANDBOX_CMD=(bash -c '
     probe() { if timeout 8 bash -c "$2" >/dev/null 2>&1; then echo "REACHABLE $1"; else echo "blocked $1"; fi; }
     echo "== egress"
-    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$HUTCH_PROBE_URL" -X POST -d "{}")
+    code=$(curl -s -o /dev/null -w "%{http_code} %{errormsg}" --max-time 15 "$HUTCH_PROBE_URL" -X POST -d "{}")
     echo "model API via gate http=$code"
-    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 6 "$HUTCH_GATE/")
+    code=$(curl -s -o /dev/null -w "%{http_code} %{errormsg}" --max-time 6 "$HUTCH_GATE/")
     echo "other gate path http=$code"
     for u in https://github.com https://proxy.golang.org https://registry.npmjs.org https://pypi.org https://api.anthropic.com https://1.1.1.1; do
       probe "direct $u" "curl -sf --max-time 6 $u"; done
