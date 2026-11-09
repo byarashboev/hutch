@@ -146,8 +146,7 @@ Ask these questions together, each with your drafted answer and the reason for i
 
 - Never trust the sandbox agent's report, and never assume a mid-run instruction was followed: check it in the final
   diff.
-- Review authorization, money, personal data, SQL, migrations and concurrency harder: mutation-test the guards, run the
-  integration tests the sandbox could not run, and get an independent review.
+- For auth, money, SQL, migrations and concurrency, review the diff yourself and run the relevant integration tests.
 - Run the checks that need Docker, a network or a browser on the host yourself; the sandbox cannot.
 - Before doing a piece of the task yourself instead of the sandbox, tell the user which piece and why.
 - When a model's limit is used up, add its name to `~/.hutch/skip` (one per line) and remove it after the reset.
