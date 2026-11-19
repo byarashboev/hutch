@@ -851,18 +851,16 @@ sandbox() {
 # checks run the agent's code. Pass `--` between docker/image args and the container command when CoW overlays apply.
 offline() {
   local -a pre_args=() cmd_args=() cow_args=()
-  local seen_sep=0 arg ov_rc=0 old_trap="" has_ov_trap=0
+  local seen_sep=0 arg ov_rc=0 old_trap
   for arg in "$@"; do
     if [[ $seen_sep -eq 0 && "$arg" == "--" ]]; then seen_sep=1
     elif [[ $seen_sep -eq 0 ]]; then pre_args+=("$arg")
     else cmd_args+=("$arg"); fi
   done
+  old_trap="$(trap -p EXIT || true)"
+  # Set first: overlay_up can stop hutch on a later entry after making the volumes of earlier ones.
+  trap overlay_down EXIT
   overlay_up "verify-$$-$(rand_hex 4)"
-  if [[ ${#OVERLAY_VOLUMES[@]} -gt 0 || ${#OVERLAY_TMP_DIRS[@]} -gt 0 ]]; then
-    old_trap="$(trap -p EXIT || true)"
-    trap overlay_down EXIT
-    has_ov_trap=1
-  fi
   if [[ ${#OVERLAY_COW_PAIRS[@]} -gt 0 ]]; then
     cow_args=(-e "HUTCH_COW_MOUNTS=$(overlay_cow_env)")
   fi
@@ -883,10 +881,8 @@ offline() {
       ${cow_args[@]+"${cow_args[@]}"} "$@" || ov_rc=$?
   fi
   overlay_down
-  if [[ $has_ov_trap -eq 1 ]]; then
-    trap - EXIT
-    [[ -z "$old_trap" ]] || eval "$old_trap"
-  fi
+  trap - EXIT
+  [[ -z "$old_trap" ]] || eval "$old_trap"
   return "$ov_rc"
 }
 

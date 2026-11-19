@@ -1218,6 +1218,7 @@ check "N6: a run record without the strong/cheap decision fails closed" '[[ $rc 
 (MODELS_FILE="$tmp/r_models_a.tsv" MODEL=cheap-1 SMALL_MODEL=s; sandbox() { return 0; }; cmd_shell rcheap) >/dev/null 2>&1
 check "N6: hutch shell records its model as a run" '[[ "$(cat "$STATE/work/rcheap/run-models")" == "cheap-1 cheap" ]]'
 unset -f need_image offline
+reload_hutch
 
 # N7: stop_sandbox_run removes the container again once the job is gone (the job may have created it after the first
 # removal), and a signal that comes after the job started but before RUN_JOB was set still stops the job.
@@ -1233,6 +1234,20 @@ mkdir -p "$tmp/r_n7out"
 r_pid="$(cat "$tmp/r_n7out/pid")"
 check "N7: a job started just before the signal, not yet in RUN_JOB, is stopped" '! kill -0 "$r_pid" 2>/dev/null'
 kill "$r_pid" 2>/dev/null
+
+# N8: when an explicit docker-overlay entry cannot be mounted, offline stops and still removes the volumes and work
+# directories of the entries before it.
+CONF="$tmp/rconf"; STATE="$tmp/rstate"; NAME=rproj; REPO="$CTXR"
+mkdir -p "$tmp/r_c0" "$tmp/r_c1"
+printf 'cache_overlays=%s:/work/c0 %s:/work/c1\ncache_overlay_mode=docker-overlay\n' "$tmp/r_c0" "$tmp/r_c1" >"$CONF/config"
+docker() { echo "$*" >>"$tmp/r_n8"; [[ "$1" != run || "$*" != *-1:/probe* ]]; }
+: >"$tmp/r_n8"
+out="$( (offline "$PROJECT_IMAGE" -- true) 2>&1)"; rc=$?
+check "N8: offline removes the overlays it made when a later one fails" '
+  [[ $rc -ne 0 && "$out" == *"cannot be mounted"* && -z "$(ls "$STATE/tmp" 2>/dev/null)" ]] &&
+  grep -q "^volume rm -f hutch-ov-rproj-verify-.*-0$" "$tmp/r_n8"'
+unset -f docker
+: >"$CONF/config"
 
 reload_hutch
 CONF="${r_saved[0]}" STATE="${r_saved[1]}" NAME="${r_saved[2]}" REPO="${r_saved[3]}" PROJECT_IMAGE="${r_saved[4]}"
