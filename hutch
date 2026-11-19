@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 # hutch: a coding agent (opencode or Claude Code) does one bounded task in an isolated container; the host agent briefs and verifies.
-#   hutch status                     machine and project state; start here (exit 3: project not set up, 4: machine not set up)
-#   hutch init [--in-repo]           create this project's config from the template (~/.hutch/projects/<name>, or <repo>/.hutch)
-#   hutch build                      build the base and project images, pull the gate, create the networks
-#   hutch new <task> <allow> <brief> clone the base branch (or $HUTCH_BRANCH) into a task workspace
-#   hutch run <task>                 run the agent on the primer and brief (log in the task's out directory)
-#   hutch say <task> <message>       follow-up message (opencode: after the run ends; claude: during the run)
-#   hutch shell <task>               interactive agent session in the sandbox
-#   hutch export <task>              write the task branch as a git bundle
-#   hutch verify <task>              fetch the bundle on the host, check paths, run the project's checks offline
-#   hutch report <task>              the task's model, usage, commits, verify status and test changes (report.md)
-#   hutch ls                         this project's tasks: age, run state, verify status, commits on the host, model
-#   hutch rm <task>                  remove a task workspace, its output and its ref
-#   hutch smoke|isolation <task>     one-line model call | egress, mount and capability probes
-#   hutch models                     the model chosen per HUTCH_KIND and the skipped models
-#   hutch needs-pro <task>           why a task needs a strong model (exit 1: it does not)
+#   hutch status                                   machine and project state; start here (exit 3: project not set up, 4: machine not set up)
+#   hutch init [--in-repo]                         create this project's config from the template (~/.hutch/projects/<name>, or <repo>/.hutch)
+#   hutch build                                    build the base and project images, pull the gate, create the networks
+#   hutch new <task> [<allow> <brief>] [options]   clone base branch; options: --allow <glob> --allow-file <f> --brief <f> --opened <f> --context <spec>
+#   hutch run [options] <task>                     run agent with watchdog; options: --context <spec> --max-turns <N> --max-timeout <S> --loop-threshold <N>
+#   hutch batch [options] <task1> <task2>...       run tasks concurrently; options: --max-parallel <N> --max-turns <N> --max-timeout <S> --loop-threshold <N>
+#   hutch say <task> <message>                     follow-up message (opencode: after the run ends; claude: during the run)
+#   hutch shell <task>                             interactive agent session in the sandbox
+#   hutch export <task>                            write the task branch as a git bundle
+#   hutch verify [options] <task>                  check bundle offline; options: --soft-scope|--strict-scope --allow-tests --allow <glob> --allow-file <f>
+#   hutch report <task>                            the task's model, usage, commits, verify status and test changes (report.md)
+#   hutch ls                                       this project's tasks: age, run state, verify status, commits on the host, model
+#   hutch rm <task>                                remove a task workspace, its output and its ref
+#   hutch smoke|isolation <task>                   one-line model call | egress, mount and capability probes
+#   hutch models                                   the model chosen per HUTCH_KIND and the skipped models
+#   hutch needs-pro <task>                         why a task needs a strong model (exit 1: it does not)
+#   Exit codes: 0 ok, 3 project not set up, 4 machine/cache missing, 42 NEEDS_SCOPE, 43 LOOP_DETECTED, 44 MAX_TURNS, 124 timeout.
 # Agents: read AGENTS.md next to this script before using it.
 # Path rules match unquoted globs on purpose (SC2053); the isolation probe is a literal script (SC2016).
 # shellcheck disable=SC2053,SC2016,SC2012
@@ -28,12 +30,12 @@ BASE_IMAGE=hutch-base:latest
 GATE_IMAGE=nginxinc/nginx-unprivileged:1.27.5-alpine@sha256:65e3e85dbaed8ba248841d9d58a899b6197106c23cb0ff1a132b7bfe0547e4c0
 NET_INTERNAL=hutch-internal
 NET_EGRESS=hutch-egress
-# The key the agents see: a placeholder, replaced by the gate.
-PLACEHOLDER_KEY=hutch-gate
 # Kinds in the model tables that count as strong models for the pro-paths rule.
 PRO_KINDS="design concurrency"
 
 die() { echo "hutch: $*" >&2; exit 1; }
+rand_hex() { od -An -tx1 -N"$1" /dev/urandom | tr -d ' \n'; }
+gen_proxy_token() { echo "hutch-proxy-$(rand_hex 16)"; }
 
 # ---- provider, agent and model -------------------------------------------------------------------------------
 
@@ -157,7 +159,6 @@ resolve_project() {
   STATE="${HUTCH_HOME}/state/${NAME}"
   PROJECT_IMAGE="hutch-${NAME}:latest"
   CACHE_VOLUME="hutch-${NAME}-cache"
-  CLAUDE_VOLUME="hutch-${NAME}-claude"
 }
 
 # try_resolve resolves the project when that works and fails quietly otherwise (resolve_project exits on errors).
@@ -186,17 +187,87 @@ patterns() { [[ -f "$1" ]] || return 0; grep -v -e '^[[:space:]]*$' -e '^#' "$1"
 
 # ---- path rules ------------------------------------------------------------------------------------------------
 
-# Paths the agent may never change, whatever the project or task says: the project's hutch config itself, and every
-# .gitattributes, because verify checks a git archive of the task branch and export-ignore in any directory would
-# hide files from the checks.
+# Paths the agent may never change, whatever the project or task says: the project's hutch config itself, git
+# metadata, CI configs, dependency manifests/lockfiles, build scripts, env/secret files, and every .gitattributes
+# (because verify checks a git archive of the task branch and export-ignore in any directory would hide files).
 ALWAYS_PROTECTED='.hutch/*
+.git
+.git/*
+*/.git
+*/.git/*
+.gitmodules
+*/.gitmodules
 .gitattributes
-*/.gitattributes'
+*/.gitattributes
+.github/*
+.gitlab-ci.yml
+*/.gitlab-ci.yml
+.circleci/*
+.buildkite/*
+Jenkinsfile
+*/Jenkinsfile
+.travis.yml
+azure-pipelines.yml
+package.json
+*/package.json
+package-lock.json
+*/package-lock.json
+pnpm-lock.yaml
+*/pnpm-lock.yaml
+yarn.lock
+*/yarn.lock
+bun.lock
+*/bun.lock
+bun.lockb
+*/bun.lockb
+go.mod
+*/go.mod
+go.sum
+*/go.sum
+Cargo.toml
+*/Cargo.toml
+Cargo.lock
+*/Cargo.lock
+pyproject.toml
+*/pyproject.toml
+poetry.lock
+*/poetry.lock
+uv.lock
+*/uv.lock
+Pipfile
+Pipfile.lock
+requirements*.txt
+*/requirements*.txt
+Gemfile
+Gemfile.lock
+composer.json
+composer.lock
+Makefile
+*/Makefile
+GNUmakefile
+*/GNUmakefile
+Dockerfile
+*/Dockerfile
+Dockerfile.*
+*/Dockerfile.*
+*.Dockerfile
+compose.yaml
+compose.yml
+docker-compose*.yml
+docker-compose*.yaml
+.env
+.env.*
+.env*
+*/.env
+*/.env.*
+*/.env*'
+
+EXTRA_ALLOW=""
 
 # opened succeeds when protected pattern $1 is openable in this project and the task's opened file lists it.
 opened() {
   local p="$1" o
-  [[ -f "$OPENED_FILE" ]] || return 1
+  [[ -f "${OPENED_FILE:-}" ]] || return 1
   grep -qxF -- "$p" "$OPENED_FILE" || return 1
   while IFS= read -r o; do [[ "$p" == "$o" ]] && return 0; done < <(patterns "$CONF/openable")
   return 1
@@ -204,7 +275,7 @@ opened() {
 
 protected() {
   local f="$1" p
-  while IFS= read -r p; do [[ "$f" == $p ]] && return 0; done <<<"$ALWAYS_PROTECTED"
+  while IFS= read -r p; do [[ -n "$p" && "$f" == $p ]] && return 0; done <<<"$ALWAYS_PROTECTED"
   while IFS= read -r p; do
     [[ "$f" == $p ]] && ! opened "$p" && return 0
   done < <(patterns "$CONF/protected")
@@ -213,8 +284,25 @@ protected() {
 
 allowed() {
   local f="$1" p
-  while IFS= read -r p; do [[ "$f" == $p ]] && return 0; done < <(patterns "$ALLOW_FILE")
+  if [[ -f "${ALLOW_FILE:-}" ]]; then
+    while IFS= read -r p; do [[ "$f" == $p ]] && return 0; done < <(patterns "$ALLOW_FILE")
+  fi
+  if [[ -n "${EXTRA_ALLOW:-}" ]]; then
+    while IFS= read -r p; do [[ -n "$p" && "$f" == $p ]] && return 0; done <<<"$EXTRA_ALLOW"
+  fi
   return 1
+}
+
+scope_mode() {
+  local m="${1:-}"
+  if [[ -z "$m" ]]; then
+    if [[ "${HUTCH_STRICT_SCOPE:-}" == 1 ]]; then m=strict
+    elif [[ "${HUTCH_SOFT_SCOPE:-}" == 1 ]]; then m=soft
+    else m="$(conf_get scope_mode)"; fi
+  fi
+  m="${m:-soft}"
+  [[ "$m" == soft || "$m" == strict ]] || die "scope_mode must be soft or strict, got '$m'"
+  echo "$m"
 }
 
 # needs_pro prints why a task (allow file $1, opened file $2) needs a strong model and succeeds. The rule is on only
@@ -237,12 +325,28 @@ DEFAULT_TESTS='(^|/)(tests?|__tests__|specs?)/|[._-](test|spec)\.[A-Za-z0-9]+$|_
 # Added lines that skip or focus tests, in the common frameworks.
 SKIP_MARKERS='\.(skip|only|todo)\(|(^|[^A-Za-z0-9_])(xit|xdescribe|xtest|fit|fdescribe)\(|t\.Skip|@pytest\.mark\.(skip|xfail)|@unittest\.skip|@Disabled|@Ignore|#\[ignore\]'
 
+test_regex() {
+  local re
+  re="$(conf_get tests)"
+  echo "${re:-$DEFAULT_TESTS}"
+}
+
+is_test_file() {
+  grep -qE -- "$(test_regex)" <<<"$1"
+}
+
+# is_preexisting_test succeeds when $2 is a test path that already existed on base commit $1.
+is_preexisting_test() {
+  local base="$1" f="$2"
+  is_test_file "$f" && git -C "$REPO" cat-file -e "${base}:${f}" 2>/dev/null
+}
+
 # test_changes names what a task did to the project's tests between commits $1 and $2: deleted test files, lines
 # removed from existing ones, added skip or focus markers, and new test files. A cheap model that cannot make a test
 # pass may weaken it instead, and the checks would still pass. With tests_policy=append-only any of those fails.
 test_changes() {
   local base="$1" ref="$2" re policy st f n skips bad=0
-  re="$(conf_get tests)"; re="${re:-$DEFAULT_TESTS}"
+  re="$(test_regex)"
   policy="$(conf_get tests_policy)"; policy="${policy:-report}"
   [[ "$policy" == report || "$policy" == append-only ]] || die "tests_policy must be report or append-only"
   while IFS=$'\t' read -r st f; do
@@ -283,51 +387,90 @@ docker_runtimes() { docker info --format '{{range $k, $v := .Runtimes}}{{println
 
 need_image() { docker image inspect "$1" >/dev/null 2>&1 || die "image $1 is missing; run hutch build"; }
 
-# gate_conf prints the gate's nginx template: one location per allowed path prefix, forwarded to the upstream over
-# verified TLS with the key set from the gate's own environment (${HUTCH_KEY}, filled in by the image's envsubst at
-# start, so the key is never written to disk), and 403 for every other path.
+# gate_location emits one nginx location block that authenticates the sandbox's per-run HUTCH_PROXY_TOKEN, blocks
+# path traversal and query-param credential smuggling, injects the host's real provider key (${HUTCH_KEY}), and strips
+# alternative auth headers so the sandbox can never use another account on the upstream host.
+gate_location() {
+  local matcher="$1" host="$2"
+  printf '%s\n' \
+    "  location $matcher {" \
+    '    if ($hutch_token_ok = 0) { return 403 "hutch gate: invalid proxy token\n"; }' \
+    '    if ($request_uri ~* "(%2e|%2f|%5c|\.\.)") { return 403 "hutch gate: invalid path\n"; }' \
+    '    if ($args ~* "(^|&)(api_?key|key|token|auth)=") { return 403 "hutch gate: credential query param not allowed\n"; }' \
+    "    proxy_pass $UPSTREAM;" \
+    "    proxy_ssl_server_name on;" \
+    "    proxy_ssl_name ${host%%:*};" \
+    "    proxy_ssl_verify on;" \
+    "    proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;" \
+    "    proxy_set_header Host $host;" \
+    '    proxy_set_header Authorization "Bearer ${HUTCH_KEY}";' \
+    '    proxy_set_header x-api-key "${HUTCH_KEY}";' \
+    '    proxy_set_header api-key "";' \
+    '    proxy_set_header x-auth-token "";' \
+    '    proxy_set_header x-goog-api-key "";' \
+    '    proxy_set_header Proxy-Authorization "";' \
+    '    proxy_set_header Cookie "";' \
+    "    proxy_http_version 1.1;" \
+    "    proxy_buffering off;" \
+    "    proxy_request_buffering off;" \
+    "    proxy_read_timeout 900s;" \
+    "  }"
+}
+
+# gate_conf prints the gate's nginx template: per-run proxy token maps, one location per allowed path prefix
+# forwarded to the upstream over verified TLS with the host key injected from ${HUTCH_KEY}, and 403 for all else.
 gate_conf() {
   local host="${UPSTREAM#https://}" p
   printf '%s\n' \
     'log_format hutch_gate '"'"'$time_iso8601 $request_method $request_uri -> $status upstream=$upstream_status'"'"';' \
+    'map_hash_bucket_size 128;' \
+    'map $http_authorization $hutch_auth_state {' \
+    '  ""                             empty;' \
+    '  "Bearer ${HUTCH_PROXY_TOKEN}"  valid;' \
+    '  default                        invalid;' \
+    '}' \
+    'map $http_x_api_key $hutch_xkey_state {' \
+    '  ""                             empty;' \
+    '  "${HUTCH_PROXY_TOKEN}"         valid;' \
+    '  default                        invalid;' \
+    '}' \
+    'map "$hutch_auth_state:$hutch_xkey_state" $hutch_token_ok {' \
+    '  "valid:valid"  1;' \
+    '  "valid:empty"  1;' \
+    '  "empty:valid"  1;' \
+    '  default        0;' \
+    '}' \
     'server {' \
     '  listen 8080;' \
     '  access_log /dev/stdout hutch_gate;' \
     '  client_max_body_size 64m;' \
     '  location = /hutch-gate-health { access_log off; return 200 "ok\n"; }'
   for p in $PATHS; do
-    printf '%s\n' \
-      "  location ^~ $p {" \
-      "    proxy_pass $UPSTREAM;" \
-      "    proxy_ssl_server_name on;" \
-      "    proxy_ssl_name ${host%%:*};" \
-      "    proxy_ssl_verify on;" \
-      "    proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;" \
-      "    proxy_set_header Host $host;" \
-      '    proxy_set_header Authorization "Bearer ${HUTCH_KEY}";' \
-      '    proxy_set_header x-api-key "${HUTCH_KEY}";' \
-      "    proxy_http_version 1.1;" \
-      "    proxy_buffering off;" \
-      "    proxy_request_buffering off;" \
-      "    proxy_read_timeout 900s;" \
-      "  }"
+    if [[ "$p" == */ ]]; then
+      gate_location "^~ $p" "$host"
+    else
+      gate_location "= $p" "$host"
+      gate_location "^~ ${p}/" "$host"
+    fi
   done
   printf '%s\n' '  location / { return 403 "hutch gate: path not allowed\n"; }' '}'
 }
 
-# gate_up starts gate $1 for one sandbox command of task $4 with the provider key, writes its template to file $2, and
-# waits until it answers. gate_down (also run on exit) appends its access log to file $3 and removes it. The labels
-# let hutch ls see which tasks are running. It sets GATE_IP, the gate's address on the internal network: the sandbox
-# uses the address, not the name, because Docker's embedded DNS does not answer inside gVisor (runtime=runsc).
+# gate_up starts gate $1 for one sandbox command of task $4 with the provider key and per-run proxy token $5, writes
+# its template to file $2, and waits until it answers. gate_down (also run on exit) appends its access log to file $3
+# and removes it.
 gate_up() {
-  local name="$1" conf="$2" key _
+  local name="$1" conf="$2" key proxy_token _
+  proxy_token="${5:-$(gen_proxy_token)}"
   key="$(api_key)"
+  if ! python3 -I -c 'import sys; k = sys.argv[1]; sys.exit(0 if k and all(32 < ord(c) < 127 and c not in "\"\\;" for c in k) else 1)' "$key"; then
+    die "API key contains unsafe characters for gate configuration"
+  fi
   gate_conf >"$conf"
   GATE_NAME="$name"; GATE_LOG="$3"
-  trap gate_down EXIT
-  HUTCH_KEY="$key" docker run -d --rm --name "$name" --network "$NET_EGRESS" --cap-drop ALL \
+  HUTCH_KEY="$key" HUTCH_PROXY_TOKEN="$proxy_token" docker run -d --rm --name "$name" --network "$NET_EGRESS" --cap-drop ALL \
     --security-opt no-new-privileges --read-only --tmpfs /tmp:mode=1777 --tmpfs /etc/nginx/conf.d:mode=1777 \
-    --memory 256m --pids-limit 64 --label "hutch.project=$NAME" --label "hutch.task=$4" -e HUTCH_KEY \
+    --memory 256m --pids-limit 64 --label "hutch.project=$NAME" --label "hutch.task=$4" -e HUTCH_KEY -e HUTCH_PROXY_TOKEN \
     -v "$conf:/etc/nginx/templates/default.conf.template:ro" "$GATE_IMAGE" >/dev/null
   docker network connect "$NET_INTERNAL" "$name"
   GATE_IP="$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NET_INTERNAL\").IPAddress}}" "$name")"
@@ -347,10 +490,139 @@ gate_down() {
   GATE_NAME=""
 }
 
-cache_args() {
-  local m; m="$(conf_get cache_mount)"
-  [[ -n "$m" ]] && echo "-v ${CACHE_VOLUME}:${m}"
-  return 0
+# ---- copy-on-write dependency and build cache overlays ---------------------------------------------------------
+
+OVERLAY_DOCKER_ARGS=()
+OVERLAY_COW_PAIRS=()
+OVERLAY_VOLUMES=()
+OVERLAY_TMP_DIRS=()
+
+cache_overlays_spec() {
+  local s="${HUTCH_CACHE_OVERLAYS:-}"
+  [[ -n "$s" ]] || s="$(conf_get cache_overlays)"
+  echo "$s"
+}
+
+resolve_overlay_mode() {
+  local m="${HUTCH_CACHE_OVERLAY_MODE:-}"
+  [[ -n "$m" ]] || m="$(conf_get cache_overlay_mode)"
+  m="${m:-auto}"
+  case "$m" in
+    auto)
+      if [[ "$(uname -s)" == Linux ]]; then echo docker-overlay
+      else echo cow-tmpfs; fi ;;
+    docker-overlay|cow-tmpfs|ro) echo "$m" ;;
+    *) die "cache_overlay_mode must be auto, docker-overlay, cow-tmpfs, or ro; got '$m'" ;;
+  esac
+}
+
+resolve_overlay_host() {
+  local p="$1"
+  case "$p" in
+    \~/*) echo "${HOME}/${p#\~/}" ;;
+    /*) echo "$p" ;;
+    *) echo "${REPO}/${p}" ;;
+  esac
+}
+
+validate_overlay_entry() {
+  local entry="$1" host ctr
+  [[ "$entry" == *:* ]] || die "cache_overlays entry must be host_path:container_path, got '$entry'"
+  host="${entry%%:*}"; ctr="${entry#*:}"
+  [[ -n "$host" && -n "$ctr" && "$ctr" != *:* ]] || die "invalid cache_overlays entry: '$entry'"
+  [[ "$host" != *,* ]] || die "cache_overlays host path cannot contain ',': '$host'"
+  [[ "$ctr" =~ ^/[A-Za-z0-9._/@+-]+(/[A-Za-z0-9._/@+-]+)*$ ]] ||
+    die "cache_overlays container path must be a safe absolute path, got '$ctr'"
+  [[ "$ctr" != */.. && "$ctr" != */../* ]] || die "cache_overlays container path cannot contain '..': '$ctr'"
+  case "$ctr" in
+    /|/work|/out|/task|/etc|/etc/*|/usr|/usr/*|/bin|/bin/*|/lib|/lib/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/tmp|/.hutch-ro|/.hutch-ro/*)
+      die "cache_overlays container path '$ctr' targets a reserved path" ;;
+  esac
+}
+
+overlay_up() {
+  local run_tag="$1" spec raw_mode mode uid gid idx=0 entry host_raw host_dir ctr_path ov_base vol m
+  OVERLAY_DOCKER_ARGS=(); OVERLAY_COW_PAIRS=(); OVERLAY_VOLUMES=(); OVERLAY_TMP_DIRS=()
+  spec="$(cache_overlays_spec)"
+  m="$(conf_get cache_mount)"
+  [[ -n "$spec" || -n "$m" ]] || return 0
+  raw_mode="${HUTCH_CACHE_OVERLAY_MODE:-$(conf_get cache_overlay_mode)}"
+  raw_mode="${raw_mode:-auto}"
+  mode="$(resolve_overlay_mode)"
+  uid="$(id -u)"; gid="$(id -g)"
+  for entry in $spec; do
+    validate_overlay_entry "$entry"
+    host_raw="${entry%%:*}"; ctr_path="${entry#*:}"
+    host_dir="$(resolve_overlay_host "$host_raw")"
+    [[ -d "$host_dir" ]] || die "cache overlay source missing: $host_dir (check cache_overlays)"
+    if [[ "$mode" == docker-overlay ]]; then
+      ov_base="${STATE}/tmp/ov-${run_tag}-${idx}"
+      mkdir -p "$ov_base/upper" "$ov_base/work"
+      vol="hutch-ov-${NAME}-${run_tag}-${idx}"
+      if docker volume create --driver local --opt type=overlay --opt device=overlay \
+        --opt "o=lowerdir=${host_dir},upperdir=${ov_base}/upper,workdir=${ov_base}/work" "$vol" >/dev/null 2>&1; then
+        OVERLAY_VOLUMES+=("$vol")
+        OVERLAY_TMP_DIRS+=("$ov_base")
+        OVERLAY_DOCKER_ARGS+=(-v "${vol}:${ctr_path}")
+      else
+        /bin/rm -rf "$ov_base"
+        [[ "$raw_mode" == auto ]] || die "failed to create overlay volume $vol for $host_dir"
+        OVERLAY_DOCKER_ARGS+=(-v "${host_dir}:/.hutch-ro/ov${idx}:ro" --tmpfs "${ctr_path}:exec,uid=${uid},gid=${gid},mode=0755")
+        OVERLAY_COW_PAIRS+=("/.hutch-ro/ov${idx}:${ctr_path}")
+      fi
+    elif [[ "$mode" == cow-tmpfs ]]; then
+      OVERLAY_DOCKER_ARGS+=(-v "${host_dir}:/.hutch-ro/ov${idx}:ro" --tmpfs "${ctr_path}:exec,uid=${uid},gid=${gid},mode=0755")
+      OVERLAY_COW_PAIRS+=("/.hutch-ro/ov${idx}:${ctr_path}")
+    else
+      OVERLAY_DOCKER_ARGS+=(-v "${host_dir}:${ctr_path}:ro")
+    fi
+    idx=$((idx + 1))
+  done
+  if [[ -n "$m" ]]; then
+    validate_overlay_entry "volume:$m"
+    if [[ "$mode" == ro ]]; then
+      OVERLAY_DOCKER_ARGS+=(-v "${CACHE_VOLUME}:${m}:ro")
+    else
+      OVERLAY_DOCKER_ARGS+=(-v "${CACHE_VOLUME}:/.hutch-ro/cache:ro" --tmpfs "${m}:exec,uid=${uid},gid=${gid},mode=0755")
+      OVERLAY_COW_PAIRS+=("/.hutch-ro/cache:${m}")
+    fi
+  fi
+}
+
+overlay_down() {
+  local vol d
+  if [[ ${#OVERLAY_VOLUMES[@]} -gt 0 ]]; then
+    for vol in "${OVERLAY_VOLUMES[@]}"; do docker volume rm -f "$vol" >/dev/null 2>&1 || true; done
+  fi
+  if [[ ${#OVERLAY_TMP_DIRS[@]} -gt 0 ]]; then
+    for d in "${OVERLAY_TMP_DIRS[@]}"; do /bin/rm -rf "$d"; done
+  fi
+  OVERLAY_DOCKER_ARGS=(); OVERLAY_COW_PAIRS=(); OVERLAY_VOLUMES=(); OVERLAY_TMP_DIRS=()
+}
+
+overlay_cow_env() {
+  local out="" p
+  for p in "${OVERLAY_COW_PAIRS[@]}"; do out+="${out:+|}${p}"; done
+  echo "$out"
+}
+
+overlay_cow_script() {
+  cat <<'EOF'
+IFS='|' read -ra _hutch_pairs <<< "${HUTCH_COW_MOUNTS:-}"
+for _hutch_p in "${_hutch_pairs[@]}"; do
+  _hutch_src="${_hutch_p%%:*}"; _hutch_dst="${_hutch_p#*:}"
+  if [ -d "$_hutch_src" ] && [ -n "$(ls -A "$_hutch_src" 2>/dev/null)" ]; then
+    mkdir -p "$_hutch_dst"
+    cp -rPs "$_hutch_src/." "$_hutch_dst/" 2>/dev/null || cp -r "$_hutch_src/." "$_hutch_dst/"
+  fi
+done
+exec "$@"
+EOF
+}
+
+cleanup_runtime() {
+  gate_down
+  overlay_down
 }
 
 # limit_args prints the process and memory limits for every container that runs the agent's code.
@@ -384,8 +656,12 @@ verify_timeout() { seconds HUTCH_VERIFY_TIMEOUT verify_timeout 1800; }
 # TIMED_OUT is the exit code of coreutils timeout when the limit is reached; the agent and the checks run under it
 # inside the container, so a stuck run or check ends instead of holding the sandbox and the model quota.
 TIMED_OUT=124
+EXIT_NEEDS_SCOPE=42
+EXIT_LOOP_DETECTED=43
+EXIT_MAX_TURNS=44
 
-# opencode_json prints the opencode configuration for one run: the provider's base URL points at the gate.
+# opencode_json prints the opencode configuration for one run: the provider's base URL points at the gate
+# and uses the per-run proxy token ($2), never the real provider key.
 opencode_json() {
   printf '%s\n' '{' \
     '  "$schema": "https://opencode.ai/config.json",' \
@@ -394,7 +670,7 @@ opencode_json() {
     "  \"model\": \"$OPENCODE_PROVIDER/$MODEL\"," \
     "  \"small_model\": \"$OPENCODE_PROVIDER/$SMALL_MODEL\"," \
     "  \"agent\": { \"general\": { \"model\": \"$OPENCODE_PROVIDER/$MODEL\" }, \"explore\": { \"model\": \"$OPENCODE_PROVIDER/$SMALL_MODEL\" } }," \
-    "  \"provider\": { \"$OPENCODE_PROVIDER\": { \"options\": { \"baseURL\": \"$1\", \"apiKey\": \"$PLACEHOLDER_KEY\" } } }" \
+    "  \"provider\": { \"$OPENCODE_PROVIDER\": { \"options\": { \"baseURL\": \"$1\", \"apiKey\": \"$2\" } } }" \
     '}'
 }
 
@@ -402,7 +678,7 @@ opencode_json() {
 # holds the key), no capabilities, only the task's files mounted. Extra docker flags come in "$@".
 sandbox() {
   local task="$1"; shift
-  local dir out gate url probe agent_args extra
+  local dir out gate url probe proxy_token agent_args extra
   dir="$(task_dir "$task")"; out="$(out_dir "$task")"
   [[ -f "$CONF/primer.md" ]] || die "missing $CONF/primer.md"
   need_image "$PROJECT_IMAGE"
@@ -410,21 +686,27 @@ sandbox() {
   # Model names go into opencode.json; brackets stay allowed for names such as deepseek-v4-pro[1m].
   local model_re='^[][A-Za-z0-9._:/-]+$'
   [[ "$MODEL" =~ $model_re && "$SMALL_MODEL" =~ $model_re ]] || die "model names may hold only letters, digits and ._:/-[]"
-  gate="hutch-gate-${NAME}-${task}-$$"
-  gate_up "$gate" "$dir/gate.conf.template" "$out/gate.log" "$task"
+  local old_trap run_id
+  old_trap="$(trap -p EXIT || true)"
+  trap cleanup_runtime EXIT
+  run_id="$(rand_hex 4)"
+  proxy_token="$(gen_proxy_token)"
+  gate="hutch-gate-${NAME}-${task}-$$-${run_id}"
+  gate_up "$gate" "$dir/gate.conf.template" "$out/gate.log" "$task" "$proxy_token"
   url="http://${GATE_IP}:8080"
   if [[ -n "$CLAUDE_BASE" ]]; then probe="$url$CLAUDE_BASE/v1/messages"; else probe="$url$OPENCODE_BASE/chat/completions"; fi
   if [[ "$AGENT" == opencode ]]; then
     # Sessions live with the task, so a follow-up (hutch say) continues the same session.
     mkdir -p "$dir/oc-data"
-    opencode_json "$url$OPENCODE_BASE" >"$dir/opencode.json"
+    opencode_json "$url$OPENCODE_BASE" "$proxy_token" >"$dir/opencode.json"
     agent_args=(-v "$dir/oc-data:/home/hutch/.local/share/opencode"
       -v "$dir/opencode.json:/home/hutch/.config/opencode/opencode.json:ro"
       -v "${HUTCH_DIR}/rules/sandbox.md:/home/hutch/.config/opencode/AGENTS.md:ro"
-      -e OPENCODE_API_KEY="$PLACEHOLDER_KEY")
+      -e OPENCODE_API_KEY="$proxy_token")
   else
-    agent_args=(-v "${CLAUDE_VOLUME}:/home/hutch/.claude" -v "${HUTCH_DIR}/rules/sandbox.md:/home/hutch/.claude/CLAUDE.md:ro"
-      -e ANTHROPIC_AUTH_TOKEN="$PLACEHOLDER_KEY" -e ANTHROPIC_BASE_URL="$url$CLAUDE_BASE"
+    mkdir -p "$dir/claude-data"
+    agent_args=(-v "$dir/claude-data:/home/hutch/.claude" -v "${HUTCH_DIR}/rules/sandbox.md:/home/hutch/.claude/CLAUDE.md:ro"
+      -e ANTHROPIC_AUTH_TOKEN="$proxy_token" -e ANTHROPIC_BASE_URL="$url$CLAUDE_BASE"
       -e ANTHROPIC_MODEL="$MODEL" -e ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL"
       -e ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" -e ANTHROPIC_DEFAULT_HAIKU_MODEL="$SMALL_MODEL"
       -e CLAUDE_CODE_SUBAGENT_MODEL="$SMALL_MODEL" -e CLAUDE_CODE_EFFORT_LEVEL="${HUTCH_EFFORT:-max}"
@@ -435,25 +717,71 @@ sandbox() {
   [[ -f "$CONF/checklist.md" ]] && extra+=(-v "$CONF/checklist.md:/task/project-checklist.md:ro")
   [[ -f "$CONF/protected" ]] && extra+=(-v "$CONF/protected:/task/protected.txt:ro")
   [[ -f "$dir/opened" ]] && extra+=(-v "$dir/opened:/task/opened.txt:ro")
+  [[ -s "$dir/context.md" ]] && extra+=(-v "$dir/context.md:/task/context.md:ro")
+  overlay_up "${task}-$$-${run_id}"
+  local -a cow_args=() run_cmd=("${SANDBOX_CMD[@]}")
+  if [[ ${#OVERLAY_COW_PAIRS[@]} -gt 0 ]]; then
+    cow_args=(-e "HUTCH_COW_MOUNTS=$(overlay_cow_env)")
+    run_cmd=(bash -c "$(overlay_cow_script)" _ "${SANDBOX_CMD[@]}")
+  fi
   local rc=0
-  # shellcheck disable=SC2046 # cache_args and limit_args print whole docker flags
-  docker run --rm "$@" \
+  # shellcheck disable=SC2046 # limit_args prints whole docker flags
+  docker run --rm ${SANDBOX_CONTAINER:+--name "$SANDBOX_CONTAINER"} "$@" \
     --network "$NET_INTERNAL" --cap-drop ALL --security-opt no-new-privileges \
     ${RUNTIME:+--runtime "$RUNTIME"} $(limit_args) --tmpfs /tmp:exec,size=4g \
     -v "$dir/repo:/work" -v "$dir/brief.md:/task/brief.md:ro" -v "$CONF/primer.md:/task/primer.md:ro" \
     -v "${HUTCH_DIR}/rules/checklist.md:/task/checklist.md:ro" -v "$out:/out" \
-    ${extra[@]+"${extra[@]}"} $(cache_args) "${agent_args[@]}" -e HUTCH_PROBE_URL="$probe" -e HUTCH_GATE="$url" \
-    "$PROJECT_IMAGE" "${SANDBOX_CMD[@]}" || rc=$?
-  gate_down
+    ${extra[@]+"${extra[@]}"} ${OVERLAY_DOCKER_ARGS[@]+"${OVERLAY_DOCKER_ARGS[@]}"} "${agent_args[@]}" \
+    ${cow_args[@]+"${cow_args[@]}"} \
+    -e HUTCH_PROXY_TOKEN="$proxy_token" -e HUTCH_PROBE_URL="$probe" -e HUTCH_GATE="$url" \
+    "$PROJECT_IMAGE" "${run_cmd[@]}" || rc=$?
+  cleanup_runtime
+  trap - EXIT
+  [[ -z "$old_trap" ]] || eval "$old_trap"
   return "$rc"
 }
 
 # offline runs a command in the project image with no network at all, under the same limits as the agent: the
-# checks run the agent's code.
+# checks run the agent's code. Pass `--` between docker/image args and the container command when CoW overlays apply.
 offline() {
-  # shellcheck disable=SC2046
-  docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:exec,size=4g \
-    ${RUNTIME:+--runtime "$RUNTIME"} $(limit_args) $(cache_args) "$@"
+  local -a pre_args=() cmd_args=() cow_args=()
+  local seen_sep=0 arg ov_rc=0 old_trap="" has_ov_trap=0
+  for arg in "$@"; do
+    if [[ $seen_sep -eq 0 && "$arg" == "--" ]]; then seen_sep=1
+    elif [[ $seen_sep -eq 0 ]]; then pre_args+=("$arg")
+    else cmd_args+=("$arg"); fi
+  done
+  overlay_up "verify-$$-$(rand_hex 4)"
+  if [[ ${#OVERLAY_VOLUMES[@]} -gt 0 || ${#OVERLAY_TMP_DIRS[@]} -gt 0 ]]; then
+    old_trap="$(trap -p EXIT || true)"
+    trap overlay_down EXIT
+    has_ov_trap=1
+  fi
+  if [[ ${#OVERLAY_COW_PAIRS[@]} -gt 0 ]]; then
+    cow_args=(-e "HUTCH_COW_MOUNTS=$(overlay_cow_env)")
+  fi
+  if [[ $seen_sep -eq 1 && ${#OVERLAY_COW_PAIRS[@]} -gt 0 ]]; then
+    # shellcheck disable=SC2046
+    docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:exec,size=4g \
+      ${RUNTIME:+--runtime "$RUNTIME"} $(limit_args) ${OVERLAY_DOCKER_ARGS[@]+"${OVERLAY_DOCKER_ARGS[@]}"} \
+      "${cow_args[@]}" "${pre_args[@]}" bash -c "$(overlay_cow_script)" _ "${cmd_args[@]}" || ov_rc=$?
+  elif [[ $seen_sep -eq 1 ]]; then
+    # shellcheck disable=SC2046
+    docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:exec,size=4g \
+      ${RUNTIME:+--runtime "$RUNTIME"} $(limit_args) ${OVERLAY_DOCKER_ARGS[@]+"${OVERLAY_DOCKER_ARGS[@]}"} \
+      "${pre_args[@]}" "${cmd_args[@]}" || ov_rc=$?
+  else
+    # shellcheck disable=SC2046
+    docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:exec,size=4g \
+      ${RUNTIME:+--runtime "$RUNTIME"} $(limit_args) ${OVERLAY_DOCKER_ARGS[@]+"${OVERLAY_DOCKER_ARGS[@]}"} \
+      ${cow_args[@]+"${cow_args[@]}"} "$@" || ov_rc=$?
+  fi
+  overlay_down
+  if [[ $has_ov_trap -eq 1 ]]; then
+    trap - EXIT
+    [[ -z "$old_trap" ]] || eval "$old_trap"
+  fi
+  return "$ov_rc"
 }
 
 # ---- commands --------------------------------------------------------------------------------------------------
@@ -488,6 +816,24 @@ cmd_status() {
     if docker_runtimes | grep -qx -- "$RUNTIME"; then line runtime "$RUNTIME ok"
     else line runtime "$RUNTIME MISSING (not in docker info; AGENTS.md, gVisor)"; [[ $rc -eq 0 ]] && rc=4; fi
   fi
+  local ov_spec ov_entry ov_host ov_ctr cm
+  ov_spec="$(cache_overlays_spec)"
+  if [[ -n "$ov_spec" ]]; then
+    local ov_mode; ov_mode="$(resolve_overlay_mode)"
+    for ov_entry in $ov_spec; do
+      validate_overlay_entry "$ov_entry"
+      ov_host="$(resolve_overlay_host "${ov_entry%%:*}")"
+      ov_ctr="${ov_entry#*:}"
+      if [[ -d "$ov_host" ]]; then line "cache $ov_ctr" "ok (ro overlay from $ov_host, mode=$ov_mode)"
+      else line "cache $ov_ctr" "MISSING ($ov_host not found)"; [[ $rc -eq 0 ]] && rc=4; fi
+    done
+  fi
+  cm="$(conf_get cache_mount)"
+  if [[ -n "$cm" ]]; then
+    if docker volume inspect "$CACHE_VOLUME" >/dev/null 2>&1; then line "cache $cm" "ok (ro overlay from volume $CACHE_VOLUME)"
+    else line "cache $cm" "ready (empty volume $CACHE_VOLUME; created on first use)"; fi
+  fi
+  [[ -n "$ov_spec" || -n "$cm" ]] || line cache "none (image-baked)"
   line tasks "$(ls "${STATE}/work" 2>/dev/null | tr '\n' ' ')"
   return "$rc"
 }
@@ -533,10 +879,132 @@ cmd_build() {
   docker build -t "$PROJECT_IMAGE" --build-arg HUTCH_BASE="$BASE_IMAGE" "$BUILD_CTX"
 }
 
+# pack_context writes numbered fenced markdown snippets from repo $1 to file $2 for each path[:start[-end]] spec.
+pack_context() {
+  local repo_dir="$1" out_file="$2"; shift 2
+  [[ $# -gt 0 ]] || { : >"$out_file"; return 0; }
+  python3 -I - "$repo_dir" "$out_file" "$@" <<'EOF'
+import os, re, sys
+from pathlib import Path
+
+repo_real = os.path.realpath(sys.argv[1])
+out_file = sys.argv[2]
+specs = sys.argv[3:]
+
+EXT_LANG = {
+    ".ts": "ts", ".tsx": "tsx", ".js": "js", ".mjs": "js", ".cjs": "js", ".jsx": "jsx",
+    ".py": "python", ".go": "go", ".rs": "rust", ".sh": "bash", ".bash": "bash",
+    ".json": "json", ".yml": "yaml", ".yaml": "yaml", ".md": "markdown",
+    ".sql": "sql", ".toml": "toml", ".css": "css", ".html": "html",
+}
+
+range_re = re.compile(r"^(.*):([0-9]+)(?:-([0-9]*))?$")
+blocks = []
+
+for raw_spec in specs:
+    spec = raw_spec.strip()
+    if not spec:
+        continue
+    m = range_re.match(spec)
+    if m:
+        rel, s_str, e_str = m.group(1), m.group(2), m.group(3)
+        start = int(s_str)
+        if e_str is None:
+            end = start
+        elif e_str == "":
+            end = None
+        else:
+            end = int(e_str)
+    else:
+        rel, start, end = spec, 1, None
+
+    if not rel or rel.startswith("/"):
+        sys.stderr.write(f"hutch: --context path must be repo-relative: {raw_spec}\n")
+        sys.exit(1)
+    parts = Path(rel).parts
+    if ".." in parts:
+        sys.stderr.write(f"hutch: --context path cannot traverse '..': {raw_spec}\n")
+        sys.exit(1)
+    base = os.path.basename(rel)
+    if base == ".env" or base.startswith(".env."):
+        sys.stderr.write(f"hutch: --context cannot include secret env files: {raw_spec}\n")
+        sys.exit(1)
+    target = os.path.realpath(os.path.join(repo_real, rel))
+    if not (target.startswith(repo_real + os.sep)):
+        sys.stderr.write(f"hutch: --context path escapes repository: {raw_spec}\n")
+        sys.exit(1)
+    if not os.path.isfile(target):
+        sys.stderr.write(f"hutch: --context file not found: {rel}\n")
+        sys.exit(1)
+    if start < 1 or (end is not None and end < start):
+        sys.stderr.write(f"hutch: invalid --context line range: {raw_spec}\n")
+        sys.exit(1)
+
+    with open(target, errors="replace") as fh:
+        lines = fh.read().splitlines()
+    total = len(lines)
+    if total == 0:
+        if start > 1:
+            sys.stderr.write(f"hutch: --context start line {start} exceeds empty file {rel}\n")
+            sys.exit(1)
+        header = f"### `{rel}` (empty file)"
+        body = "(empty file)"
+    else:
+        if start > total:
+            sys.stderr.write(f"hutch: --context start line {start} exceeds {rel} length ({total})\n")
+            sys.exit(1)
+        actual_end = min(end, total) if end is not None else total
+        width = max(4, len(str(actual_end)))
+        header = f"### `{rel}` (lines {start}-{actual_end} of {total})"
+        body = "\n".join(f"{idx:>{width}} | {lines[idx - 1]}" for idx in range(start, actual_end + 1))
+
+    lang = EXT_LANG.get(os.path.splitext(rel)[1].lower(), "")
+    blocks.append(f"{header}\n```{lang}\n{body}\n```")
+
+with open(out_file, "w") as out_fh:
+    if blocks:
+        out_fh.write("\n\n".join(blocks) + "\n")
+EOF
+}
+
 cmd_new() {
-  local task="$1" allow="$2" brief="$3" dir
+  local task="" allow_file="" brief="" opened_opt="" dir
+  local -a pos=() allow_globs=() context_specs=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --allow) [[ $# -ge 2 ]] || die "--allow requires a pattern"; allow_globs+=("$2"); shift 2 ;;
+      --allow-file) [[ $# -ge 2 ]] || die "--allow-file requires a path"; allow_file="$2"; shift 2 ;;
+      --brief) [[ $# -ge 2 ]] || die "--brief requires a path"; brief="$2"; shift 2 ;;
+      --opened) [[ $# -ge 2 ]] || die "--opened requires a path"; opened_opt="$2"; shift 2 ;;
+      --context) [[ $# -ge 2 ]] || die "--context requires a spec"; context_specs+=("$2"); shift 2 ;;
+      --) shift; while [[ $# -gt 0 ]]; do pos+=("$1"); shift; done ;;
+      -*) die "unknown option for new: $1" ;;
+      *) pos+=("$1"); shift ;;
+    esac
+  done
+  [[ ${#pos[@]} -ge 1 && ${#pos[@]} -le 3 ]] ||
+    die "usage: hutch new <task> [<allow-file> <brief-file>] [--allow <glob>...] [--allow-file <file>] [--brief <file>] [--opened <file>] [--context <spec>...]"
+  task="${pos[0]}"
+  if [[ ${#pos[@]} -ge 2 ]]; then
+    [[ -z "$allow_file" ]] || die "cannot pass both positional allow-file and --allow-file"
+    allow_file="${pos[1]}"
+  fi
+  if [[ ${#pos[@]} -ge 3 ]]; then
+    [[ -z "$brief" ]] || die "cannot pass both positional brief-file and --brief"
+    brief="${pos[2]}"
+  fi
   [[ "$task" =~ ^[a-z0-9-]+$ ]] || die "task name must match [a-z0-9-]+"
-  [[ -f "$allow" && -f "$brief" ]] || die "allow and brief files must exist"
+  [[ -n "$brief" && -f "$brief" ]] || die "brief file must exist"
+  if [[ -n "$allow_file" ]]; then
+    [[ -f "$allow_file" ]] || die "allow file must exist: $allow_file"
+  elif [[ ${#allow_globs[@]} -eq 0 ]]; then
+    die "allow file or --allow pattern required"
+  fi
+  [[ -z "$opened_opt" || -f "$opened_opt" ]] || die "opened file must exist: $opened_opt"
+  if [[ -n "${HUTCH_CONTEXT:-}" ]]; then
+    local c
+    for c in $HUTCH_CONTEXT; do context_specs+=("$c"); done
+  fi
   dir="$(task_dir "$task")"
   [[ ! -e "$dir" ]] || die "$dir exists"
   mkdir -p "$dir" "$(out_dir "$task")"
@@ -546,9 +1014,21 @@ cmd_new() {
   git -C "$dir/repo" config user.name "hutch agent"
   git -C "$dir/repo" config user.email "hutch@localhost"
   git -C "$dir/repo" rev-parse HEAD >"$dir/base"
-  /bin/cp -f "$allow" "$dir/allow"
+  mkdir -p "$dir/repo/.git/info"
+  grep -qxF '.hutch-needs-scope' "$dir/repo/.git/info/exclude" 2>/dev/null ||
+    echo '.hutch-needs-scope' >>"$dir/repo/.git/info/exclude"
+  if [[ -n "$allow_file" ]]; then /bin/cp -f "$allow_file" "$dir/allow"; else : >"$dir/allow"; fi
+  if [[ ${#allow_globs[@]} -gt 0 ]]; then
+    local g
+    for g in "${allow_globs[@]}"; do printf '%s\n' "$g" >>"$dir/allow"; done
+  fi
   /bin/cp -f "$brief" "$dir/brief.md"
-  if [[ -n "${HUTCH_OPENED:-}" ]]; then /bin/cp -f "$HUTCH_OPENED" "$dir/opened"; echo "opened: $(tr '\n' ' ' <"$dir/opened")"; fi
+  local opened_src="${opened_opt:-${HUTCH_OPENED:-}}"
+  if [[ -n "$opened_src" ]]; then /bin/cp -f "$opened_src" "$dir/opened"; echo "opened: $(tr '\n' ' ' <"$dir/opened")"; fi
+  if [[ ${#context_specs[@]} -gt 0 ]]; then
+    printf '%s\n' "${context_specs[@]}" >"$dir/context.specs"
+    pack_context "$dir/repo" "$dir/context.md" "${context_specs[@]}"
+  fi
   echo "workspace $dir at $(cat "$dir/base")"
 }
 
@@ -576,62 +1056,541 @@ EOF
 }
 
 kickoff() {
+  local task="${1:-}" base ctx_file
   case "${HUTCH_PHASE:-}" in
-    design) echo "PHASE 1 (design only). Read /task/primer.md, /task/brief.md, /task/checklist.md and /task/project-checklist.md if it exists, then the sources the brief names. Write /out/design-notes.md exactly as the checklist's 'Design notes' section says. Do not change any file under /work, run no generator and commit nothing. Then stop with a two-line report." ;;
-    build) echo "PHASE 2 (build). Read /task/primer.md, /task/brief.md, /task/checklist.md, /task/project-checklist.md if it exists, and /out/design-notes.md; its 'Reviewer notes' section, if present, overrides the notes. Complete the task under your sandbox rules, following the design notes." ;;
-    "") echo "Read /task/primer.md, then /task/brief.md, /task/checklist.md and /task/project-checklist.md if it exists, and complete the task under your sandbox rules." ;;
+    design) base="PHASE 1 (design only). Read /task/primer.md, /task/brief.md, /task/checklist.md and /task/project-checklist.md if it exists, then the sources the brief names. Write /out/design-notes.md exactly as the checklist's 'Design notes' section says. Do not change any file under /work, run no generator and commit nothing. Then stop with a two-line report." ;;
+    build) base="PHASE 2 (build). Read /task/primer.md, /task/brief.md, /task/checklist.md, /task/project-checklist.md if it exists, and /out/design-notes.md; its 'Reviewer notes' section, if present, overrides the notes. Complete the task under your sandbox rules, following the design notes." ;;
+    "") base="Read /task/primer.md, then /task/brief.md, /task/checklist.md and /task/project-checklist.md if it exists, and complete the task under your sandbox rules." ;;
     *) die "HUTCH_PHASE must be design or build" ;;
+  esac
+  if [[ -n "$task" ]]; then
+    ctx_file="$(task_dir "$task")/context.md"
+    if [[ -s "$ctx_file" ]]; then
+      python3 -I - "$base" "$ctx_file" <<'EOF'
+import sys
+base, path = sys.argv[1], sys.argv[2]
+with open(path, errors="replace") as fh:
+    data = fh.read()
+limit = 98304
+if len(data.encode("utf-8")) > limit:
+    encoded = data.encode("utf-8")[:limit].decode("utf-8", errors="ignore")
+    data = encoded + "\n... (truncated inline; full context in /task/context.md)\n"
+sys.stdout.write(base + "\n\n## Pre-packed context (use these snippets directly; avoid redundant discovery)\n\n" + data)
+EOF
+      return
+    fi
+  fi
+  echo "$base"
+}
+
+# watchdog_inspect inspects run.jsonl, .hutch-needs-scope files, turn count, and consecutive failure loops.
+# Outputs ACTION=... and REASON=... (plus writes payload to $out_dir/watchdog.detail) when an abort should fire.
+watchdog_inspect() {
+  python3 -I - "$1" "$2" "$3" "$4" "$5" <<'EOF'
+import json, os, re, sys
+
+log_path, work_dir, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+max_turns, loop_threshold = int(sys.argv[4]), int(sys.argv[5])
+detail_file = os.path.join(out_dir, "watchdog.detail")
+
+# 1. Early scope escalation (.hutch-needs-scope or HUTCH_NEEDS_SCOPE: markers)
+scope_paths = []
+seen_paths = set()
+
+def add_path(p):
+    p = p.strip().strip("`'\",;")
+    if p and p not in seen_paths:
+        seen_paths.add(p)
+        scope_paths.append(p)
+
+for candidate in (os.path.join(work_dir, ".hutch-needs-scope"), os.path.join(out_dir, ".hutch-needs-scope")):
+    if os.path.isfile(candidate):
+        with open(candidate, errors="replace") as fh:
+            for raw in fh:
+                line = raw.split("#", 1)[0].strip()
+                if line:
+                    add_path(line)
+
+def collect_texts(obj):
+    out = []
+    if isinstance(obj, str):
+        out.append(obj)
+    elif isinstance(obj, list):
+        for item in obj:
+            out.extend(collect_texts(item))
+    elif isinstance(obj, dict):
+        for k in ("text", "result", "content", "output"):
+            if k in obj:
+                out.extend(collect_texts(obj[k]))
+        for k in ("part", "message"):
+            if isinstance(obj.get(k), dict):
+                out.extend(collect_texts(obj[k]))
+    return out
+
+def flatten_text(obj):
+    if obj is None:
+        return ""
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, list):
+        return "\n".join(flatten_text(x) for x in obj if x is not None)
+    if isinstance(obj, dict):
+        if "text" in obj and isinstance(obj["text"], str):
+            return obj["text"]
+        if "content" in obj:
+            return flatten_text(obj["content"])
+        return json.dumps(obj, sort_keys=True)
+    return str(obj)
+
+ansi_re = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+def norm_ws(s):
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+def norm_err(s):
+    s = ansi_re.sub("", s or "")
+    return norm_ws(s)[:300]
+
+marker_re = re.compile(r"^\s*HUTCH_NEEDS_SCOPE:\s*(.+)$", re.MULTILINE)
+exit_code_re = re.compile(r"(?:^|\n)Exit code\s+([1-9][0-9]*)\b")
+
+started_turns = 0
+finished_turns = 0
+seen_assistant_ids = set()
+pending_tools = {}
+
+cmd_streak = 0
+last_fail_cmd = None
+err_streak = 0
+last_fail_err = None
+last_detail = ""
+
+def record_success():
+    global cmd_streak, last_fail_cmd, err_streak, last_fail_err
+    cmd_streak = 0
+    last_fail_cmd = None
+    err_streak = 0
+    last_fail_err = None
+
+def record_failure(cmd_sig, err_sig, detail):
+    global cmd_streak, last_fail_cmd, err_streak, last_fail_err, last_detail
+    if cmd_sig:
+        if cmd_sig == last_fail_cmd:
+            cmd_streak += 1
+        else:
+            last_fail_cmd = cmd_sig
+            cmd_streak = 1
+    else:
+        cmd_streak = 0
+        last_fail_cmd = None
+    if err_sig:
+        if err_sig == last_fail_err:
+            err_streak += 1
+        else:
+            last_fail_err = err_sig
+            err_streak = 1
+    else:
+        err_streak = 0
+        last_fail_err = None
+    last_detail = detail.strip()
+
+if os.path.isfile(log_path):
+    with open(log_path, errors="replace") as fh:
+        for raw in fh:
+            texts = [raw]
+            e = None
+            try:
+                e = json.loads(raw)
+                if isinstance(e, dict):
+                    texts.extend(collect_texts(e))
+            except ValueError:
+                e = None
+
+            for txt in texts:
+                for m in marker_re.finditer(txt):
+                    for tok in re.split(r"[,\s]+", m.group(1).strip()):
+                        if tok:
+                            add_path(tok)
+
+            if not isinstance(e, dict):
+                continue
+
+            etype = e.get("type")
+            part = e.get("part") if isinstance(e.get("part"), dict) else {}
+            ptype = part.get("type")
+
+            if etype == "step_start" or ptype == "step-start" or etype in ("turn", "turn_start"):
+                started_turns += 1
+            elif etype == "step_finish" or ptype == "step-finish":
+                finished_turns += 1
+            elif etype == "assistant":
+                msg = e.get("message") if isinstance(e.get("message"), dict) else {}
+                mid = msg.get("id")
+                if mid:
+                    if mid not in seen_assistant_ids:
+                        seen_assistant_ids.add(mid)
+                        started_turns += 1
+                else:
+                    started_turns += 1
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for blk in content:
+                        if isinstance(blk, dict) and blk.get("type") == "tool_use" and blk.get("id"):
+                            pending_tools[blk["id"]] = (blk.get("name") or "", blk.get("input") or {})
+            elif etype == "user":
+                msg = e.get("message") if isinstance(e.get("message"), dict) else {}
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for blk in content:
+                        if isinstance(blk, dict) and blk.get("type") == "tool_result":
+                            tid = blk.get("tool_use_id")
+                            tname, tinp = pending_tools.get(tid, ("", {}))
+                            if not isinstance(tinp, dict):
+                                tinp = {}
+                            cmd = tinp.get("command") or tinp.get("cmd") or ""
+                            cstr = flatten_text(blk.get("content"))
+                            is_err = bool(blk.get("is_error"))
+                            if not is_err and exit_code_re.search(cstr):
+                                is_err = True
+                            if is_err:
+                                csig = norm_ws(cmd) if cmd else (f"{tname}:{norm_ws(json.dumps(tinp, sort_keys=True))}" if tname else "")
+                                esig = norm_err(cstr)
+                                detail = (f"command: {cmd}\n" if cmd else f"tool: {tname}\n") + cstr[:1500]
+                                record_failure(csig, esig, detail)
+                            else:
+                                record_success()
+            elif etype == "tool_use":
+                state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                status = state.get("status")
+                inp = state.get("input") if isinstance(state.get("input"), dict) else {}
+                tool = part.get("tool") or ""
+                cmd = inp.get("command") or inp.get("cmd") or ""
+                meta = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
+                exit_code = meta.get("exit")
+                err_txt = flatten_text(state.get("error"))
+                out_txt = flatten_text(state.get("output"))
+                if status == "error" or (isinstance(exit_code, int) and exit_code != 0) or bool(err_txt):
+                    csig = norm_ws(cmd) if cmd else (f"{tool}:{norm_ws(json.dumps(inp, sort_keys=True))}" if tool else "")
+                    combined = err_txt or out_txt or f"exit {exit_code}"
+                    esig = norm_err(combined)
+                    detail = (f"command: {cmd}\n" if cmd else f"tool: {tool}\n") + combined[:1500]
+                    record_failure(csig, esig, detail)
+                elif status == "completed":
+                    record_success()
+            elif etype == "error":
+                err_obj = e.get("error")
+                msg_txt = err_obj.get("message") if isinstance(err_obj, dict) else flatten_text(err_obj or e.get("message"))
+                if msg_txt:
+                    record_failure("", norm_err(msg_txt), msg_txt[:1500])
+            elif etype == "result":
+                nt = e.get("num_turns")
+                if isinstance(nt, int):
+                    finished_turns = max(finished_turns, nt)
+                if e.get("is_error"):
+                    rtxt = flatten_text(e.get("result") or e.get("errors") or "result error")
+                    record_failure("", norm_err(rtxt), rtxt[:1500])
+            elif etype == "command_result":
+                cmd = e.get("command") or ""
+                ec = e.get("exit_code", 0)
+                rtxt = flatten_text(e.get("error") or e.get("output") or "")
+                if isinstance(ec, int) and ec != 0:
+                    record_failure(norm_ws(cmd), norm_err(rtxt or f"exit {ec}"), f"command: {cmd}\n{rtxt[:1500]}")
+                else:
+                    record_success()
+
+if scope_paths:
+    with open(detail_file, "w") as dfh:
+        dfh.write("\n".join(scope_paths) + "\n")
+    print("ACTION=NEEDS_SCOPE")
+    print("REASON=sandbox requested additional scope")
+    sys.exit(0)
+
+if loop_threshold > 0 and (cmd_streak >= loop_threshold or err_streak >= loop_threshold):
+    with open(detail_file, "w") as dfh:
+        dfh.write(last_detail + "\n" if last_detail else "")
+    if cmd_streak >= loop_threshold:
+        print("ACTION=LOOP_DETECTED")
+        print(f"REASON=identical failing command repeated {cmd_streak} times")
+    else:
+        print("ACTION=LOOP_DETECTED")
+        print(f"REASON=identical error repeated {err_streak} times")
+    sys.exit(0)
+
+if max_turns > 0 and max(started_turns, finished_turns) > max_turns:
+    with open(detail_file, "w") as dfh:
+        dfh.write(f"turns started={started_turns}, finished={finished_turns}, max_turns={max_turns}\n")
+    print("ACTION=MAX_TURNS")
+    print(f"REASON=exceeded max_turns={max_turns}")
+    sys.exit(0)
+EOF
+}
+
+stop_sandbox_run() {
+  local ctr="$1" job_pid="$2" tail_pid="${3:-}"
+  [[ -n "$tail_pid" ]] && kill "$tail_pid" 2>/dev/null || true
+  if [[ -n "$ctr" ]] && command -v docker >/dev/null 2>&1; then
+    docker rm -f "$ctr" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$job_pid" ]]; then
+    command -v pkill >/dev/null 2>&1 && pkill -P "$job_pid" 2>/dev/null || true
+    kill "$job_pid" 2>/dev/null || true
+    wait "$job_pid" 2>/dev/null || true
+  fi
+}
+
+handle_watchdog_action() {
+  local action="$1" reason="$2" out="$3"
+  case "$action" in
+    NEEDS_SCOPE)
+      /bin/cp -f "$out/watchdog.detail" "$out/needs-scope.txt"
+      echo "$EXIT_NEEDS_SCOPE" >"$out/exit.code"
+      echo "EARLY_ABORT: NEEDS_SCOPE"
+      cat "$out/needs-scope.txt"
+      return "$EXIT_NEEDS_SCOPE" ;;
+    LOOP_DETECTED)
+      { echo "EARLY_ABORT: LOOP_DETECTED ($reason)"; [[ -s "$out/watchdog.detail" ]] && cat "$out/watchdog.detail"; } >"$out/abort.log"
+      echo "$EXIT_LOOP_DETECTED" >"$out/exit.code"
+      cat "$out/abort.log"
+      return "$EXIT_LOOP_DETECTED" ;;
+    MAX_TURNS)
+      { echo "EARLY_ABORT: MAX_TURNS ($reason)"; [[ -s "$out/watchdog.detail" ]] && cat "$out/watchdog.detail"; } >"$out/abort.log"
+      echo "$EXIT_MAX_TURNS" >"$out/exit.code"
+      cat "$out/abort.log"
+      return "$EXIT_MAX_TURNS" ;;
   esac
 }
 
 # The Claude Code session reads stream-json from steer.jsonl through tail, so hutch say reaches it mid-run. When the
 # session is idle (run_idle) or the sandbox has exited, tail is stopped and stdin closes, which ends the session.
 cmd_run() {
-  need_task "$1"
+  local task="" max_turns_opt="" max_timeout_opt="" loop_opt=""
+  local -a cli_ctx=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --context) [[ $# -ge 2 ]] || die "--context requires a spec"; cli_ctx+=("$2"); shift 2 ;;
+      --max-turns) [[ $# -ge 2 ]] || die "--max-turns requires a number"; max_turns_opt="$2"; shift 2 ;;
+      --max-timeout) [[ $# -ge 2 ]] || die "--max-timeout requires whole seconds"; max_timeout_opt="$2"; shift 2 ;;
+      --loop-threshold) [[ $# -ge 2 ]] || die "--loop-threshold requires a number"; loop_opt="$2"; shift 2 ;;
+      --) shift; [[ $# -gt 0 && -z "$task" ]] && { task="$1"; shift; }; break ;;
+      -*) die "unknown option for run: $1" ;;
+      *) [[ -z "$task" ]] || die "unexpected argument for run: $1"; task="$1"; shift ;;
+    esac
+  done
+  need_task "$task"
   need_models
-  need_pro_kind "$1"
-  local task="$1" out steer tailpid msg limit
-  out="$(out_dir "$task")"; steer="$out/steer.jsonl"
-  msg="$(kickoff)"
-  limit="$(run_timeout)"
-  /bin/rm -f "$out/tail.pid" "$out/exit.code"
+  need_pro_kind "$task"
+
+  local dir out steer tailpid="" msg limit max_turns loop_threshold
+  dir="$(task_dir "$task")"; out="$(out_dir "$task")"; steer="$out/steer.jsonl"
+
+  if [[ -n "$max_timeout_opt" ]]; then
+    [[ "$max_timeout_opt" =~ ^[0-9]+$ ]] || die "--max-timeout must be whole seconds, got '$max_timeout_opt'"
+    limit="$max_timeout_opt"
+  else
+    limit="$(run_timeout)"
+  fi
+  max_turns="${max_turns_opt:-${HUTCH_MAX_TURNS:-$(conf_get max_turns)}}"
+  max_turns="${max_turns:-0}"
+  [[ "$max_turns" =~ ^[0-9]+$ ]] || die "max_turns must be a whole number, got '$max_turns'"
+  loop_threshold="${loop_opt:-${HUTCH_LOOP_THRESHOLD:-$(conf_get loop_threshold)}}"
+  loop_threshold="${loop_threshold:-3}"
+  [[ "$loop_threshold" =~ ^[0-9]+$ ]] || die "loop_threshold must be a whole number, got '$loop_threshold'"
+
+  local -a merged_ctx=() dedup_ctx=()
+  if [[ -f "$dir/context.specs" ]]; then
+    local line
+    while IFS= read -r line; do [[ -n "$line" ]] && merged_ctx+=("$line"); done <"$dir/context.specs"
+  fi
+  if [[ ${#cli_ctx[@]} -gt 0 ]]; then
+    local c; for c in "${cli_ctx[@]}"; do merged_ctx+=("$c"); done
+  fi
+  if [[ -n "${HUTCH_CONTEXT:-}" ]]; then
+    local c; for c in $HUTCH_CONTEXT; do merged_ctx+=("$c"); done
+  fi
+  if [[ ${#merged_ctx[@]} -gt 0 ]]; then
+    local c seen
+    for c in "${merged_ctx[@]}"; do
+      seen=0
+      if [[ ${#dedup_ctx[@]} -gt 0 ]]; then
+        local d; for d in "${dedup_ctx[@]}"; do [[ "$d" == "$c" ]] && { seen=1; break; }; done
+      fi
+      [[ $seen -eq 0 ]] && dedup_ctx+=("$c")
+    done
+    printf '%s\n' "${dedup_ctx[@]}" >"$dir/context.specs"
+    pack_context "$dir/repo" "$dir/context.md" "${dedup_ctx[@]}"
+  fi
+
+  msg="$(kickoff "$task")"
+  /bin/rm -f "$out/tail.pid" "$out/exit.code" "$out/needs-scope.txt" "$out/abort.log" "$out/watchdog.detail"
   # A later phase keeps the earlier phase's log.
   [[ -s "$out/run.jsonl" ]] && /bin/mv -f "$out/run.jsonl" "$out/run.$(date +%Y%m%d%H%M%S).jsonl"
   : >"$out/run.jsonl"
   echo "$(date -u +%FT%TZ) agent=$AGENT provider=$PROVIDER kind=$KIND model=$MODEL small=$SMALL_MODEL phase=${HUTCH_PHASE:-}" >>"$out/models.log"
+
+  RUN_ID="$(rand_hex 4)"
+  SANDBOX_CONTAINER="hutch-run-${NAME}-${task}-$$-${RUN_ID}"
+  local job
   if [[ "$AGENT" == opencode ]]; then
     # opencode run takes one message and exits when the agent stops; hutch say continues the session afterwards.
     : >"$steer"
     SANDBOX_CMD=(timeout -k 30 "$limit" opencode run --standalone --auto --format json --title "$task" "$msg")
-    local rc=0
-    sandbox "$task" >"$out/run.jsonl" 2>"$out/run.err" || rc=$?
-    echo "$rc" >"$out/exit.code"
-    echo "log: $out/run.jsonl (sandbox exit $rc)"
-    [[ $rc -eq $TIMED_OUT ]] && echo "hutch: the run hit its ${limit}s limit (HUTCH_RUN_TIMEOUT / run_timeout)" >&2
-    return "$rc"
+    (
+      sandbox "$task" >"$out/run.jsonl" 2>"$out/run.err"
+      echo $? >"$out/exit.code"
+    ) </dev/null >/dev/null 2>&1 &
+    job=$!
+  else
+    user_line "$msg" >"$steer"
+    SANDBOX_CMD=(timeout -k 30 "$limit" claude -p --input-format stream-json --output-format stream-json --verbose
+      --dangerously-skip-permissions)
+    (
+      set +o pipefail
+      sh -c 'echo $$ >"$1"; exec tail -n +1 -f "$2"' _ "$out/tail.pid" "$steer" |
+        { sandbox "$task" -i >"$out/run.jsonl" 2>"$out/run.err"; echo $? >"$out/exit.code"; }
+    ) >/dev/null 2>&1 &
+    job=$!
+    until [[ -s "$out/tail.pid" || -f "$out/exit.code" ]]; do sleep 0.1; done
+    [[ -s "$out/tail.pid" ]] && tailpid="$(cat "$out/tail.pid")"
   fi
-  user_line "$msg" >"$steer"
-  SANDBOX_CMD=(timeout -k 30 "$limit" claude -p --input-format stream-json --output-format stream-json --verbose
-    --dangerously-skip-permissions)
-  (
-    set +o pipefail
-    sh -c 'echo $$ >"$1"; exec tail -n +1 -f "$2"' _ "$out/tail.pid" "$steer" |
-      { sandbox "$task" -i >"$out/run.jsonl" 2>"$out/run.err"; echo $? >"$out/exit.code"; }
-  ) &
-  local job=$!
-  until [[ -s "$out/tail.pid" ]]; do sleep 0.2; done
-  tailpid="$(cat "$out/tail.pid")"
+
+  local start_ts ticks=0 poll_s inspect_out action reason abort_rc=0
+  start_ts="$(date +%s)"
   while :; do
-    if [[ -f "$out/exit.code" ]] || run_idle "$out/run.jsonl" "$steer"; then break; fi
-    sleep 5
+    inspect_out="$(watchdog_inspect "$out/run.jsonl" "$dir/repo" "$out" "$max_turns" "$loop_threshold")"
+    if [[ -n "$inspect_out" ]]; then
+      action="$(printf '%s\n' "$inspect_out" | awk -F= '$1 == "ACTION" { print $2; exit }')"
+      reason="$(printf '%s\n' "$inspect_out" | awk -F= '$1 == "REASON" { print substr($0, 8); exit }')"
+      stop_sandbox_run "$SANDBOX_CONTAINER" "$job" "$tailpid"
+      SANDBOX_CONTAINER=""
+      /bin/rm -f "$out/tail.pid"
+      handle_watchdog_action "$action" "$reason" "$out" || abort_rc=$?
+      return "$abort_rc"
+    fi
+    if [[ -f "$out/exit.code" ]]; then break; fi
+    if (( $(date +%s) - start_ts >= limit )); then
+      stop_sandbox_run "$SANDBOX_CONTAINER" "$job" "$tailpid"
+      SANDBOX_CONTAINER=""
+      /bin/rm -f "$out/tail.pid"
+      echo "$TIMED_OUT" >"$out/exit.code"
+      echo "log: $out/run.jsonl (sandbox exit $TIMED_OUT)"
+      echo "hutch: the run hit its ${limit}s limit (HUTCH_RUN_TIMEOUT / run_timeout)" >&2
+      return "$TIMED_OUT"
+    fi
+    if [[ "$AGENT" != opencode ]] && run_idle "$out/run.jsonl" "$steer"; then break; fi
+    if [[ -n "${HUTCH_WATCHDOG_POLL:-}" ]]; then poll_s="$HUTCH_WATCHDOG_POLL"
+    elif [[ $ticks -lt 5 ]]; then poll_s=0.2
+    else poll_s=1; fi
+    ticks=$((ticks + 1))
+    sleep "$poll_s"
   done
-  kill "$tailpid" 2>/dev/null || true
+
+  [[ -n "$tailpid" ]] && kill "$tailpid" 2>/dev/null || true
   wait "$job" || true
+  SANDBOX_CONTAINER=""
   /bin/rm -f "$out/tail.pid"
-  echo "log: $out/run.jsonl (sandbox exit $(cat "$out/exit.code" 2>/dev/null || echo unknown))"
-  [[ "$(cat "$out/exit.code" 2>/dev/null)" == "$TIMED_OUT" ]] &&
+  inspect_out="$(watchdog_inspect "$out/run.jsonl" "$dir/repo" "$out" "$max_turns" "$loop_threshold")"
+  if [[ -n "$inspect_out" ]]; then
+    action="$(printf '%s\n' "$inspect_out" | awk -F= '$1 == "ACTION" { print $2; exit }')"
+    reason="$(printf '%s\n' "$inspect_out" | awk -F= '$1 == "REASON" { print substr($0, 8); exit }')"
+    handle_watchdog_action "$action" "$reason" "$out" || abort_rc=$?
+    return "$abort_rc"
+  fi
+  local rc
+  rc="$(cat "$out/exit.code" 2>/dev/null || echo 1)"
+  echo "log: $out/run.jsonl (sandbox exit $rc)"
+  [[ "$rc" == "$TIMED_OUT" ]] &&
     echo "hutch: the run hit its ${limit}s limit (HUTCH_RUN_TIMEOUT / run_timeout)" >&2
-  [[ "$(cat "$out/exit.code" 2>/dev/null)" == 0 ]]
+  return "$rc"
+}
+
+batch_outcome_label() {
+  case "$1" in
+    0) echo "ok" ;;
+    "$EXIT_NEEDS_SCOPE") echo "NEEDS_SCOPE" ;;
+    "$EXIT_LOOP_DETECTED") echo "LOOP_DETECTED" ;;
+    "$EXIT_MAX_TURNS") echo "MAX_TURNS" ;;
+    "$TIMED_OUT") echo "TIMEOUT" ;;
+    *) echo "failed" ;;
+  esac
+}
+
+# cmd_batch runs multiple existing tasks concurrently (bounded by --max-parallel if given) with isolated
+# per-run gates, overlays, agent state, and logs, then prints a summary table and exits non-zero if any failed.
+cmd_batch() {
+  local max_parallel=0
+  local -a run_flags=() batch_tasks=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --max-parallel)
+        [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]*$ ]] || die "--max-parallel requires a positive integer"
+        max_parallel="$2"; shift 2 ;;
+      --max-turns|--max-timeout|--loop-threshold)
+        [[ $# -ge 2 ]] || die "$1 requires a value"
+        run_flags+=("$1" "$2"); shift 2 ;;
+      --) shift; while [[ $# -gt 0 ]]; do batch_tasks+=("$1"); shift; done ;;
+      -*) die "unknown option for batch: $1" ;;
+      *) batch_tasks+=("$1"); shift ;;
+    esac
+  done
+  [[ ${#batch_tasks[@]} -gt 0 ]] ||
+    die "usage: hutch batch [--max-parallel <N>] [--max-turns <N>] [--max-timeout <S>] [--loop-threshold <N>] <task1> <task2>..."
+  need_models
+  local t
+  for t in "${batch_tasks[@]}"; do
+    need_task "$t"
+    need_pro_kind "$t"
+  done
+
+  local -a pids=() active_idx=() rcs=()
+  local i n="${#batch_tasks[@]}" k rc next_pids=() next_idx=()
+  for (( i = 0; i < n; i++ )); do rcs+=(-1); done
+
+  for (( i = 0; i < n; i++ )); do
+    if [[ $max_parallel -gt 0 ]]; then
+      while [[ ${#pids[@]} -ge $max_parallel ]]; do
+        sleep 0.1
+        next_pids=(); next_idx=()
+        for (( k = 0; k < ${#pids[@]}; k++ )); do
+          if kill -0 "${pids[$k]}" 2>/dev/null; then
+            next_pids+=("${pids[$k]}")
+            next_idx+=("${active_idx[$k]}")
+          else
+            rc=0
+            wait "${pids[$k]}" || rc=$?
+            rcs[${active_idx[$k]}]="$rc"
+          fi
+        done
+        pids=(${next_pids[@]+"${next_pids[@]}"})
+        active_idx=(${next_idx[@]+"${next_idx[@]}"})
+      done
+    fi
+    t="${batch_tasks[$i]}"
+    echo "batch: starting $t"
+    (
+      cmd_run ${run_flags[@]+"${run_flags[@]}"} "$t" >"$(out_dir "$t")/batch.log" 2>&1
+    ) </dev/null >/dev/null 2>&1 &
+    pids+=($!)
+    active_idx+=("$i")
+  done
+
+  if [[ ${#pids[@]} -gt 0 ]]; then
+    for (( k = 0; k < ${#pids[@]}; k++ )); do
+      rc=0
+      wait "${pids[$k]}" || rc=$?
+      rcs[${active_idx[$k]}]="$rc"
+    done
+  fi
+
+  local any_fail=0 label
+  echo "== batch summary"
+  printf '%-24s %-6s %s\n' TASK EXIT OUTCOME
+  for (( i = 0; i < n; i++ )); do
+    t="${batch_tasks[$i]}"
+    rc="${rcs[$i]}"
+    label="$(batch_outcome_label "$rc")"
+    printf '%-24s %-6s %s\n' "$t" "$rc" "$label"
+    [[ "$rc" -eq 0 ]] || any_fail=1
+  done
+  return "$any_fail"
 }
 
 cmd_say() {
@@ -673,11 +1632,34 @@ cmd_export() {
 }
 
 cmd_verify() {
-  need_task "$1"
-  local task="$1" dir out base ref bundle heads files f bad=0 tree
+  local task="" mode_arg="" allow_tests=0 allow_override=""
+  local -a extra_globs=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --soft-scope) mode_arg=soft; shift ;;
+      --strict-scope) mode_arg=strict; shift ;;
+      --allow-tests) allow_tests=1; shift ;;
+      --allow) [[ $# -ge 2 ]] || die "--allow requires a pattern"; extra_globs+=("$2"); shift 2 ;;
+      --allow-file) [[ $# -ge 2 ]] || die "--allow-file requires a path"; allow_override="$2"; shift 2 ;;
+      --) shift; [[ $# -gt 0 && -z "$task" ]] && { task="$1"; shift; }; break ;;
+      -*) die "unknown option for verify: $1" ;;
+      *) [[ -z "$task" ]] || die "unexpected argument for verify: $1"; task="$1"; shift ;;
+    esac
+  done
+  need_task "$task"
+  local dir out base ref bundle heads files f bad=0 tree mode
+  local -a unscoped=()
   dir="$(task_dir "$task")"; out="$(out_dir "$task")"; base="$(cat "$dir/base")"; ref="refs/hutch/$task"
   bundle="$out/$task.bundle"
-  ALLOW_FILE="$dir/allow"; OPENED_FILE="$dir/opened"
+  mode="$(scope_mode "$mode_arg")"
+  [[ "${HUTCH_ALLOW_TESTS:-}" == 1 ]] && allow_tests=1
+  ALLOW_FILE="${allow_override:-$dir/allow}"; OPENED_FILE="$dir/opened"
+  EXTRA_ALLOW=""
+  if [[ ${#extra_globs[@]} -gt 0 ]]; then
+    local g
+    for g in "${extra_globs[@]}"; do EXTRA_ALLOW+="${g}"$'\n'; done
+  fi
+  [[ -f "$ALLOW_FILE" ]] || die "allow file not found: $ALLOW_FILE"
   [[ -f "$bundle" ]] || die "no bundle; run hutch export $task"
   # The outcome is kept for hutch report; every failure below goes through vfail.
   vfail() { echo "failed: $*" >"$out/verify.status"; die "$*"; }
@@ -688,14 +1670,26 @@ cmd_verify() {
   git -C "$REPO" fetch --quiet --no-tags "$bundle" "+$heads:$ref"
   git -C "$REPO" merge-base --is-ancestor "$base" "$ref" || vfail "$ref does not build on $base"
   echo "== commits"; git -C "$REPO" log --oneline "$base..$ref"
-  echo "== files"
+  echo "== files (scope=$mode)"
   files="$(git -C "$REPO" diff --name-only "$base" "$ref")"
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     if protected "$f"; then echo "PROTECTED $f"; bad=1
-    elif ! allowed "$f"; then echo "NOT-ALLOWED $f"; bad=1
-    else echo "ok $f"; fi
+    elif [[ $allow_tests -ne 1 ]] && is_preexisting_test "$base" "$f"; then
+      echo "PROTECTED-TEST $f (pre-existing test; pass --allow-tests to permit)"; bad=1
+    elif allowed "$f"; then echo "ok $f"
+    elif [[ "$mode" == soft ]]; then echo "UNSCOPED $f"; unscoped+=("$f")
+    else echo "NOT-ALLOWED $f"; bad=1; fi
   done <<<"$files"
+  if [[ ${#unscoped[@]} -gt 0 ]]; then
+    echo "== WARN: UNSCOPED_PATHS"
+    for f in "${unscoped[@]}"; do echo "UNSCOPED $f"; done
+    echo "--- unscoped diff stat ---"
+    git -C "$REPO" diff --stat "$base" "$ref" -- "${unscoped[@]}"
+    printf '%s\n' "${unscoped[@]}" >"$out/unscoped.txt"
+  else
+    /bin/rm -f "$out/unscoped.txt"
+  fi
   echo "== added comment lines"
   git -C "$REPO" diff -U0 "$base" "$ref" -- . ':(exclude)*.md' |
     grep -E '^\+[[:space:]]*(//|/\*|\*|#|--)' | grep -v '^+++' || echo "(none)"
@@ -714,12 +1708,17 @@ cmd_verify() {
   local limit rc=0
   limit="$(verify_timeout)"
   offline -v "$tree:/work" -v "$out/changed.txt:/task/changed.txt:ro" -v "$CONF/verify.sh:/task/verify.sh:ro" \
-    "$PROJECT_IMAGE" timeout -k 10 "$limit" bash -euo pipefail /task/verify.sh /task/changed.txt 2>&1 |
+    "$PROJECT_IMAGE" -- timeout -k 10 "$limit" bash -euo pipefail /task/verify.sh /task/changed.txt 2>&1 |
     tee "$out/verify.log" || rc=$?
   [[ $rc -eq $TIMED_OUT ]] && vfail "checks hit their ${limit}s limit (HUTCH_VERIFY_TIMEOUT / verify_timeout): $out/verify.log"
   [[ $rc -eq 0 ]] || vfail "checks failed: $out/verify.log"
-  echo "passed" >"$out/verify.status"
-  echo "verify passed: now review the diff yourself: git -C $REPO diff $base $ref"
+  if [[ ${#unscoped[@]} -gt 0 ]]; then
+    echo "passed (warn: ${#unscoped[@]} unscoped)" >"$out/verify.status"
+    echo "verify passed (WARN: UNSCOPED_PATHS - ${#unscoped[@]} extra path(s) outside allowlist; review before accepting): git -C $REPO diff $base $ref"
+  else
+    echo "passed" >"$out/verify.status"
+    echo "verify passed: now review the diff yourself: git -C $REPO diff $base $ref"
+  fi
 }
 
 # run_usage sums what the agents' logs in out directory $1 report: opencode step_finish events and Claude Code result
@@ -799,14 +1798,26 @@ cmd_report() {
       echo "## Test changes"
       echo
       test_changes "$base" "$ref" | sed 's/^/- /' || true
+      if [[ -s "$out/unscoped.txt" ]]; then
+        echo
+        echo "## WARN: UNSCOPED_PATHS"
+        echo
+        sed 's/^/- /' "$out/unscoped.txt"
+      fi
     else
       echo "No commits on the host yet: run hutch export $task, then hutch verify $task."
+    fi
+    if [[ -s "$out/needs-scope.txt" ]]; then
+      echo
+      echo "## Requested Scope Escalation"
+      echo
+      sed 's/^/- /' "$out/needs-scope.txt"
     fi
     echo
     echo "## To review"
     echo
     local f
-    for f in self-review.md design-notes.md verify.log run.err gate.log; do
+    for f in self-review.md design-notes.md verify.log run.err gate.log abort.log needs-scope.txt; do
       [[ -s "$out/$f" ]] && echo "- $out/$f"
     done
     echo "- git -C $REPO diff $base $ref"
@@ -820,8 +1831,18 @@ cmd_isolation() {
   SANDBOX_CMD=(bash -c '
     probe() { if timeout 8 bash -c "$2" >/dev/null 2>&1; then echo "REACHABLE $1"; else echo "blocked $1"; fi; }
     echo "== egress"
-    code=$(curl -s -o /dev/null -w "%{http_code} %{errormsg}" --max-time 15 "$HUTCH_PROBE_URL" -X POST -d "{}")
+    code=$(curl -s -o /dev/null -w "%{http_code} %{errormsg}" --max-time 15 -H "Authorization: Bearer $HUTCH_PROXY_TOKEN" "$HUTCH_PROBE_URL" -X POST -d "{}")
     echo "model API via gate http=$code"
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 6 -H "Authorization: Bearer sk-attacker-account" "$HUTCH_PROBE_URL" -X POST -d "{}")
+    echo "spoofed Authorization http=$code"
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 6 -H "x-api-key: sk-attacker-account" "$HUTCH_PROBE_URL" -X POST -d "{}")
+    echo "spoofed x-api-key http=$code"
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 6 "$HUTCH_PROBE_URL" -X POST -d "{}")
+    echo "missing auth http=$code"
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 6 -H "Authorization: Bearer $HUTCH_PROXY_TOKEN" "${HUTCH_PROBE_URL}/%2e%2e/secret")
+    echo "path traversal http=$code"
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 6 -H "Authorization: Bearer $HUTCH_PROXY_TOKEN" "${HUTCH_PROBE_URL}?api_key=sk-attacker")
+    echo "query credential http=$code"
     code=$(curl -s -o /dev/null -w "%{http_code} %{errormsg}" --max-time 6 "$HUTCH_GATE/")
     echo "other gate path http=$code"
     for u in https://github.com https://proxy.golang.org https://registry.npmjs.org https://pypi.org https://api.anthropic.com https://1.1.1.1; do
@@ -837,8 +1858,11 @@ cmd_isolation() {
     for d in .ssh .kube .aws .config/gh .docker .pgpass .netrc; do [ -e "$HOME/$d" ] && echo "PRESENT ~/$d"; done
     ls /var/run/docker.sock 2>/dev/null && echo "PRESENT docker.sock"
     echo "== env names"; env | cut -d= -f1 | sort | tr "\n" " "; echo
-    if [ "${ANTHROPIC_AUTH_TOKEN:-hutch-gate}${OPENCODE_API_KEY:-hutch-gate}" = hutch-gatehutch-gate ]; then
-      echo "provider key: not in the sandbox (placeholder only)"; else echo "PRESENT provider key"; fi
+    if [ -n "${HUTCH_PROXY_TOKEN:-}" ] && [ "${HUTCH_PROXY_TOKEN#hutch-proxy-}" != "$HUTCH_PROXY_TOKEN" ] &&
+       [ "${ANTHROPIC_AUTH_TOKEN:-$HUTCH_PROXY_TOKEN}" = "$HUTCH_PROXY_TOKEN" ] &&
+       [ "${OPENCODE_API_KEY:-$HUTCH_PROXY_TOKEN}" = "$HUTCH_PROXY_TOKEN" ] &&
+       [ -z "${HUTCH_API_KEY:-}${HUTCH_KEY:-}${DEEPSEEK_API_KEY:-}${OPENAI_API_KEY:-}${ANTHROPIC_API_KEY:-}" ]; then
+      echo "provider key: not in the sandbox (proxy token only)"; else echo "PRESENT provider key"; fi
     echo "== capabilities"; grep CapEff /proc/self/status
     echo "== kernel"; echo "kernel $(uname -r)"
   ')
@@ -918,12 +1942,13 @@ main() {
       need_project
       setup_runtime
       case "$cmd" in
-        new) [[ $# -eq 3 ]] || die "usage: hutch new <task> <allow-file> <brief-file>"; cmd_new "$@" ;;
-        run) cmd_run "${1:-}" ;;
+        new) cmd_new "$@" ;;
+        run) cmd_run "$@" ;;
+        batch) cmd_batch "$@" ;;
         say) [[ $# -eq 2 ]] || die "usage: hutch say <task> <message>"; cmd_say "$@" ;;
         shell) cmd_shell "$@" ;;
         export) cmd_export "${1:-}" ;;
-        verify) cmd_verify "${1:-}" ;;
+        verify) cmd_verify "$@" ;;
         rm) cmd_rm "${1:-}" ;;
         ls) cmd_ls ;;
         isolation) cmd_isolation "${1:-}" ;;
