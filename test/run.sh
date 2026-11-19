@@ -737,6 +737,7 @@ MODEL=m SMALL_MODEL=s AGENT=opencode
 cmd_new ga --allow 'src/*.ts' --brief "$tmp/vbrief" >/dev/null
 GA_OUT="$STATE/out/ga"; GA_REPO="$STATE/work/ga/repo"
 export HUTCH_WATCHDOG_POLL=0.1
+ga_secs() { echo $(( $(date +%s) - ga_t0 )); }
 
 # B1: /out is the sandbox subdirectory; the files hutch writes are in a directory no container sees.
 docker() {
@@ -833,8 +834,6 @@ out="$( (cmd_run ga) 2>&1)"; rc=$?
 reload_hutch
 check "minor: HUTCH_NEEDS_SCOPE: in claude assistant text stops the run" '[[ $rc -eq 42 && "$(cat "$GA_OUT/needs-scope.txt")" == src/c.ts ]]'
 
-ga_secs() { echo $(( $(date +%s) - ga_t0 )); }
-
 # M2: a stopped run removes its gates by name, in case its job was killed while gate_up ran.
 docker() { printf '%s\n' "$*" >>"$tmp/ga_stop"; [[ "$1" == ps ]] && echo g-leaked; return 0; }
 : >"$tmp/ga_stop"
@@ -871,6 +870,23 @@ check "minor: --max-timeout 0 runs with no limit" '[[ $rc -eq 0 && "$(cat "$tmp/
 out="$( (HUTCH_RUN_TIMEOUT=0 cmd_run ga) 2>&1)"; rc=$?
 reload_hutch
 check "minor: run_timeout=0 runs with no limit" '[[ $rc -eq 0 ]]'
+
+# Minor: batch rejects duplicate tasks, and on TERM stops its runs and their sandboxes and prints the summary.
+out="$( (cmd_batch ga ga) 2>&1)"; rc=$?
+check "minor: batch rejects a task listed twice" '[[ $rc -ne 0 && "$out" == *"listed twice"* ]]'
+cmd_new gb --allow 'src/*.ts' --brief "$tmp/vbrief" >/dev/null
+sandbox() { sh -c 'echo $$ >"$1"; exec sleep 30' _ "$tmp/ga_sleep_$1"; }
+ga_t0="$(date +%s)"
+(cmd_batch ga gb) >"$tmp/ga_batch" 2>&1 &
+bpid=$!
+sleep 2; kill -TERM "$bpid"; wait "$bpid"; rc=$?; el="$(ga_secs)"
+reload_hutch
+out="$(cat "$tmp/ga_batch")"
+check "minor: batch on TERM stops every run, kills their sandboxes and prints the summary" '
+  [[ $rc -eq 143 && $el -lt 10 && "$out" == *"== batch summary"* &&
+     "$(grep -c " interrupted$" "$tmp/ga_batch")" == 2 ]] &&
+  ! kill -0 "$(cat "$tmp/ga_sleep_ga")" 2>/dev/null && ! kill -0 "$(cat "$tmp/ga_sleep_gb")" 2>/dev/null'
+unset HUTCH_WATCHDOG_POLL
 
 echo "failures: $fails"
 [[ $fails -eq 0 ]]

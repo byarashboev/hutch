@@ -1338,6 +1338,14 @@ stop_sandbox_run() {
   fi
 }
 
+# run_interrupted stops the running sandbox (RUN_JOB, RUN_TAIL, SANDBOX_CONTAINER) when hutch run gets INT or TERM.
+run_interrupted() {
+  trap - INT TERM
+  stop_sandbox_run "${SANDBOX_CONTAINER:-}" "${RUN_JOB:-}" "${RUN_TAIL:-}"
+  echo "hutch: the run was interrupted and its sandbox stopped" >&2
+  exit "$1"
+}
+
 handle_watchdog_action() {
   local action="$1" reason="$2" out="$3"
   case "$action" in
@@ -1433,6 +1441,10 @@ cmd_run() {
   RUN_ID="$(rand_hex 4)"
   SANDBOX_CONTAINER="hutch-run-${NAME}-${task}-$$-${RUN_ID}"
   local job
+  # Ctrl-C or hutch batch stopping this run also stops its sandbox and gate.
+  RUN_JOB=""; RUN_TAIL=""
+  trap 'run_interrupted 130' INT
+  trap 'run_interrupted 143' TERM
   if [[ "$AGENT" == opencode ]]; then
     # opencode run takes one message and exits when the agent stops; hutch say continues the session afterwards.
     : >"$steer"
@@ -1442,7 +1454,7 @@ cmd_run() {
       sandbox "$task" >"$out/run.jsonl" 2>"$out/run.err" || rc=$?
       echo "$rc" >"$out/exit.code"
     ) </dev/null >/dev/null 2>&1 &
-    job=$!
+    job=$!; RUN_JOB=$job
   else
     user_line "$msg" >"$steer"
     SANDBOX_CMD=(timeout -k 30 "$limit" claude -p --input-format stream-json --output-format stream-json --verbose
@@ -1452,9 +1464,10 @@ cmd_run() {
       sh -c 'echo $$ >"$1"; exec tail -n +1 -f "$2"' _ "$out/tail.pid" "$steer" |
         { rc=0; sandbox "$task" -i >"$out/run.jsonl" 2>"$out/run.err" || rc=$?; echo "$rc" >"$out/exit.code"; }
     ) >/dev/null 2>&1 &
-    job=$!
+    job=$!; RUN_JOB=$job
     until [[ -s "$out/tail.pid" || -f "$out/exit.code" ]] || ! kill -0 "$job" 2>/dev/null; do sleep 0.1; done
     [[ -s "$out/tail.pid" ]] && tailpid="$(cat "$out/tail.pid")"
+    RUN_TAIL="$tailpid"
   fi
 
   local start_ts ticks=0 poll_s inspect_out action reason abort_rc=0
@@ -1468,6 +1481,7 @@ cmd_run() {
       action="$(printf '%s\n' "$inspect_out" | awk -F= '$1 == "ACTION" { print $2; exit }')"
       reason="$(printf '%s\n' "$inspect_out" | awk -F= '$1 == "REASON" { print substr($0, 8); exit }')"
       stop_sandbox_run "$SANDBOX_CONTAINER" "$job" "$tailpid"
+      trap - INT TERM
       SANDBOX_CONTAINER=""
       /bin/rm -f "$out/tail.pid"
       handle_watchdog_action "$action" "$reason" "$out" || abort_rc=$?
@@ -1479,6 +1493,7 @@ cmd_run() {
     # A limit of 0 means no limit, as with timeout.
     if (( limit > 0 && $(date +%s) - start_ts >= limit )); then
       stop_sandbox_run "$SANDBOX_CONTAINER" "$job" "$tailpid"
+      trap - INT TERM
       SANDBOX_CONTAINER=""
       /bin/rm -f "$out/tail.pid"
       echo "$TIMED_OUT" >"$out/exit.code"
@@ -1497,6 +1512,7 @@ cmd_run() {
   [[ -n "$tailpid" ]] && kill "$tailpid" 2>/dev/null || true
   local rc=0
   wait "$job" || rc=$?
+  trap - INT TERM
   # The job writes the sandbox's exit code; a job that died before writing it leaves its own status.
   if [[ -f "$out/exit.code" ]]; then rc="$(cat "$out/exit.code")"; else echo "$rc" >"$out/exit.code"; fi
   SANDBOX_CONTAINER=""
@@ -1521,6 +1537,8 @@ batch_outcome_label() {
     "$EXIT_LOOP_DETECTED") echo "LOOP_DETECTED" ;;
     "$EXIT_MAX_TURNS") echo "MAX_TURNS" ;;
     "$TIMED_OUT") echo "TIMEOUT" ;;
+    130|143) echo "interrupted" ;;
+    -1) echo "not started" ;;
     *) echo "failed" ;;
   esac
 }
@@ -1546,19 +1564,25 @@ cmd_batch() {
   [[ ${#batch_tasks[@]} -gt 0 ]] ||
     die "usage: hutch batch [--max-parallel <N>] [--max-turns <N>] [--max-timeout <S>] [--loop-threshold <N>] <task1> <task2>..."
   need_models
-  local t
+  local t seen=" "
   for t in "${batch_tasks[@]}"; do
     need_task "$t"
     need_pro_kind "$t"
+    [[ "$seen" != *" $t "* ]] || die "batch: task $t is listed twice"
+    seen+="$t "
   done
 
   local -a pids=() active_idx=() rcs=()
-  local i n="${#batch_tasks[@]}" k rc next_pids=() next_idx=()
+  local i n="${#batch_tasks[@]}" k rc next_pids=() next_idx=() stop="" stopped=0
   for (( i = 0; i < n; i++ )); do rcs+=(-1); done
+  # On Ctrl-C or TERM, start no more tasks, stop the running ones (each stops its own sandbox and gate) and still
+  # print the summary.
+  trap 'stop=130' INT
+  trap 'stop=143' TERM
 
   for (( i = 0; i < n; i++ )); do
     if [[ $max_parallel -gt 0 ]]; then
-      while [[ ${#pids[@]} -ge $max_parallel ]]; do
+      while [[ -z "$stop" && ${#pids[@]} -ge $max_parallel ]]; do
         sleep 0.1
         next_pids=(); next_idx=()
         for (( k = 0; k < ${#pids[@]}; k++ )); do
@@ -1575,6 +1599,7 @@ cmd_batch() {
         active_idx=(${next_idx[@]+"${next_idx[@]}"})
       done
     fi
+    [[ -z "$stop" ]] || break
     t="${batch_tasks[$i]}"
     echo "batch: starting $t"
     (
@@ -1584,13 +1609,21 @@ cmd_batch() {
     active_idx+=("$i")
   done
 
-  if [[ ${#pids[@]} -gt 0 ]]; then
-    for (( k = 0; k < ${#pids[@]}; k++ )); do
+  for (( k = 0; k < ${#pids[@]}; k++ )); do
+    while :; do
+      if [[ -n "$stop" && $stopped -eq 0 ]]; then
+        echo "batch: stopping the running tasks" >&2
+        kill -TERM "${pids[@]}" 2>/dev/null || true
+        stopped=1
+      fi
       rc=0
       wait "${pids[$k]}" || rc=$?
-      rcs[${active_idx[$k]}]="$rc"
+      # A signal ends wait while the task still runs: stop the tasks, then wait again.
+      kill -0 "${pids[$k]}" 2>/dev/null || break
     done
-  fi
+    rcs[${active_idx[$k]}]="$rc"
+  done
+  trap - INT TERM
 
   local any_fail=0 label
   echo "== batch summary"
@@ -1602,6 +1635,7 @@ cmd_batch() {
     printf '%-24s %-6s %s\n' "$t" "$rc" "$label"
     [[ "$rc" -eq 0 ]] || any_fail=1
   done
+  [[ -z "$stop" ]] || return "$stop"
   return "$any_fail"
 }
 
