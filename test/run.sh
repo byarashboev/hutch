@@ -959,15 +959,14 @@ check "M1: run and opencode follow-ups record their model in the task directory"
   [[ "$(tr "\n" " " <"$STATE/work/brec/run-models")" == "glm-5.2 cheap glm-5.2 cheap " ]]'
 
 CONF="$tmp/bdeny"; mkdir -p "$CONF"; : >"$CONF/protected"; : >"$CONF/config"
-bdeny_missing=""
-for p in makefile sub/makefile GNUmakefile sub/GNUmakefile composer.json a/b/composer.json a/composer.lock \
+# unprotected prints the paths among its arguments that protected() lets through.
+unprotected() { local p; for p in "$@"; do protected "$p" || printf '%s ' "$p"; done; }
+bdeny_missing="$(unprotected makefile sub/makefile GNUmakefile sub/GNUmakefile composer.json a/b/composer.json a/composer.lock \
   Gemfile sub/Gemfile Gemfile.lock sub/Gemfile.lock compose.yaml sub/compose.yml docker-compose.yml \
   sub/docker-compose.yaml .npmrc sub/.npmrc .yarnrc .yarnrc.yml sub/.yarnrc.yml .husky/pre-commit sub/.husky/pre-push \
   go.work go.work.sum sub/go.work setup.py sub/setup.cfg pom.xml sub/pom.xml build.gradle sub/build.gradle.kts \
   settings.gradle sub/settings.gradle.kts pytest.ini sub/pytest.ini jest.config.js sub/jest.config.ts \
-  conftest.py tests/conftest.py; do
-  protected "$p" || bdeny_missing+="$p "
-done
+  conftest.py tests/conftest.py)"
 check "minor: hard denylist covers more build, manifest and test-config files at any depth (missing: $bdeny_missing)" '
   [[ -z "$bdeny_missing" ]] && ! protected src/setup_helpers.py && ! protected src/pom.xml.md'
 check "minor: default test pattern matches Tests/ directories and *Test.php files" '
@@ -1250,11 +1249,8 @@ unset -f docker
 : >"$CONF/config"
 
 # R1: more test-runner and hook configs are in the hard denylist, at any depth.
-r_missing=""
-for p in tox.ini sub/tox.ini vitest.config.ts sub/vitest.config.mjs phpunit.xml sub/phpunit.xml phpunit.xml.dist \
-  sub/phpunit.xml.dist .pre-commit-config.yaml sub/.pre-commit-config.yaml; do
-  protected "$p" || r_missing+="$p "
-done
+r_missing="$(unprotected tox.ini sub/tox.ini vitest.config.ts sub/vitest.config.mjs phpunit.xml sub/phpunit.xml \
+  phpunit.xml.dist sub/phpunit.xml.dist .pre-commit-config.yaml sub/.pre-commit-config.yaml)"
 check "R1: hard denylist covers tox, vitest, phpunit and pre-commit configs (missing: $r_missing)" '[[ -z "$r_missing" ]]'
 
 reload_hutch
