@@ -1181,6 +1181,20 @@ check "N4: a sandbox outside hutch run is named and removed before its gate and 
   [[ "$r_ctr" == hutch-run-rproj-ra-* && -n "$r_ctr_rm" && -n "$r_gate_rm" && -n "$r_net_rm" &&
      $r_ctr_rm -lt $r_gate_rm && $r_ctr_rm -lt $r_net_rm ]]'
 
+# N5: networks left by a killed run are pruned (hutch-labelled, unused and older than a minute, so never a starting
+# run's) by hutch build and before each run creates its own.
+docker() { echo "$*" >>"$tmp/r_n5"; [[ "$1" != inspect ]] || echo 172.30.0.5; return 0; }
+: >"$tmp/r_n5"
+(HUTCH_API_KEY=sk-n5 gate_up hutch-gate-rproj-ra-1-ab "$tmp/r_n5.conf" "$tmp/r_n5.log" ra tok) >/dev/null 2>&1
+r_prune="network prune -f --filter label=hutch.project --filter until=1m"
+r_prune_at="$(grep -nxF -- "$r_prune" "$tmp/r_n5" | cut -d: -f1)"
+r_create_at="$(grep -n -- "^network create " "$tmp/r_n5" | cut -d: -f1)"
+(try_resolve() { CONF=""; }; cmd_build) >/dev/null 2>&1
+check "N5: stale hutch networks are pruned before a run creates its network and by hutch build" '
+  [[ -n "$r_prune_at" && -n "$r_create_at" && $r_prune_at -lt $r_create_at ]] &&
+  [[ "$(grep -cxF -- "$r_prune" "$tmp/r_n5")" == 2 ]]'
+unset -f docker
+
 reload_hutch
 CONF="${r_saved[0]}" STATE="${r_saved[1]}" NAME="${r_saved[2]}" REPO="${r_saved[3]}" PROJECT_IMAGE="${r_saved[4]}"
 

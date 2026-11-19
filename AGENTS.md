@@ -152,7 +152,8 @@ Ask these questions together, each with your drafted answer and the reason for i
    `hutch batch [--max-parallel <N>] [--max-turns <N>] [--max-timeout <S>] [--loop-threshold <N>] <task1> <task2> ...`
    (or concurrent `hutch run` invocations). Every run gets unique gate names, proxy tokens, CoW overlays, and per-task
    agent state directories (`oc-data` / `claude-data`), and its own internal network shared only by its sandbox and gate.
-   Docker's default address pools allow roughly 30 bridge networks, so a very large fan-out can hit that limit. On Ctrl-C or
+   Docker's default address pools allow roughly 30 bridge networks, so a very large fan-out can hit that limit (`hutch build`
+   and every run remove the unused networks a killed run left behind). On Ctrl-C or
    TERM, `batch` stops all runs and still prints its summary (outcomes `interrupted` and `not started`; exit 130/143);
    it rejects a task named twice.
 8. After the run, check the exit code and `run.err` (in `~/.hutch/state/<name>/out/<task>/`):

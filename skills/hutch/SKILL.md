@@ -76,7 +76,7 @@ Every `hutch` sandbox isolates its gate container, per-run proxy token, internal
 hutch batch --max-parallel 4 --max-turns 12 --max-timeout 600 mod-a mod-b mod-c mod-d
 ```
 
-Docker's default address pools allow roughly 30 bridge networks (one per run), so very large fan-outs may hit that. Ctrl-C stops all runs and still prints the summary (`interrupted` / `not started`; exit 130/143); a task named twice is rejected.
+Docker's default address pools allow roughly 30 bridge networks (one per run), so very large fan-outs may hit that (`hutch build` and every run remove unused networks a killed run left behind). Ctrl-C stops all runs and still prints the summary (`interrupted` / `not started`; exit 130/143); a task named twice is rejected.
 
 Or run `hutch run t1 & hutch run t2 & wait`, followed by concurrent `hutch export` / `hutch verify`.
 

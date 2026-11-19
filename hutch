@@ -445,6 +445,10 @@ docker_runtimes() { docker info --format '{{range $k, $v := .Runtimes}}{{println
 
 need_image() { docker image inspect "$1" >/dev/null 2>&1 || die "image $1 is missing; run hutch build"; }
 
+# prune_networks removes the per-run networks a killed run left behind (Docker has room for only about 30 networks):
+# hutch-labelled, unused and older than a minute. A starting run connects its gate within seconds of creating one.
+prune_networks() { docker network prune -f --filter label=hutch.project --filter until=1m >/dev/null 2>&1 || true; }
+
 # gate_location emits one nginx location block that authenticates the sandbox's per-run HUTCH_PROXY_TOKEN, injects the
 # host's real provider key (${HUTCH_KEY}), and strips alternative auth headers so the sandbox can never use another
 # account on the upstream host. The request URI is forwarded as sent, so it must be plain: unreserved path characters
@@ -532,6 +536,7 @@ gate_up() {
   gate_conf >"$conf"
   GATE_LOG="$3"
   GATE_NET="hutch-net-${name#hutch-gate-}"
+  prune_networks
   docker network create --internal --label "hutch.project=$NAME" --label "hutch.task=$4" "$GATE_NET" >/dev/null
   GATE_NAME="$name"
   HUTCH_KEY="$key" HUTCH_PROXY_TOKEN="$proxy_token" docker run -d --rm --name "$name" --network "$NET_EGRESS" --cap-drop ALL \
@@ -943,6 +948,7 @@ cmd_build() {
   docker build -t "$BASE_IMAGE" --build-arg HUTCH_UID="$(id -u)" --build-arg HUTCH_GID="$(id -g)" "${HUTCH_DIR}/image"
   docker pull -q "$GATE_IMAGE" >/dev/null
   docker network inspect "$NET_EGRESS" >/dev/null 2>&1 || docker network create "$NET_EGRESS" >/dev/null
+  prune_networks
   # The allowlist proxy of earlier versions held no key but is no longer used: the gate replaced it. The shared
   # internal network of earlier versions is replaced by one network per run (gate_up).
   docker rm -f hutch-proxy >/dev/null 2>&1 || true
