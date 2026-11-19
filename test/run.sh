@@ -833,5 +833,44 @@ out="$( (cmd_run ga) 2>&1)"; rc=$?
 reload_hutch
 check "minor: HUTCH_NEEDS_SCOPE: in claude assistant text stops the run" '[[ $rc -eq 42 && "$(cat "$GA_OUT/needs-scope.txt")" == src/c.ts ]]'
 
+ga_secs() { echo $(( $(date +%s) - ga_t0 )); }
+
+# M2: a stopped run removes its gates by name, in case its job was killed while gate_up ran.
+docker() { printf '%s\n' "$*" >>"$tmp/ga_stop"; [[ "$1" == ps ]] && echo g-leaked; return 0; }
+: >"$tmp/ga_stop"
+stop_sandbox_run hutch-run-proj-ga-123-abcd "" ""
+check "M2: stop_sandbox_run removes the run's gates by name" '
+  grep -qxF "ps -aq --filter name=hutch-gate-proj-ga-123-" "$tmp/ga_stop" && grep -qxF "rm -f g-leaked" "$tmp/ga_stop"'
+unset -f docker
+reload_hutch
+
+# M2: scope markers left by an earlier run are removed when a run starts.
+printf 'src/x.ts\n' >"$GA_REPO/.hutch-needs-scope"; printf 'src/y.ts\n' >"$GA_OUT/sandbox/.hutch-needs-scope"
+sandbox() { touch "$tmp/ga_ran"; return 0; }
+out="$( (cmd_run ga) 2>&1)"; rc=$?
+reload_hutch
+check "M2: a stale .hutch-needs-scope does not stop the next run" '
+  [[ $rc -eq 0 && -e "$tmp/ga_ran" && "$out" != *NEEDS_SCOPE* && ! -e "$GA_REPO/.hutch-needs-scope" ]]'
+
+# B2: a sandbox that exits non-zero ends the run at once, under set -e, for both agents.
+sandbox() { return 3; }
+ga_t0="$(date +%s)"; out="$( (set -e; cmd_run --max-timeout 6 ga) 2>&1)"; rc=$?; el="$(ga_secs)"
+check "B2: opencode: a failing sandbox returns its exit code at once" '[[ $rc -eq 3 && $el -lt 5 && "$(cat "$GA_OUT/exit.code")" == 3 ]]'
+ga_t0="$(date +%s)"; out="$( (set -e; AGENT=claude; cmd_run --max-timeout 6 ga) 2>&1)"; rc=$?; el="$(ga_secs)"
+check "B2: claude: a failing sandbox returns its exit code at once" '[[ $rc -eq 3 && $el -lt 5 ]]'
+# B2/M4: the run also ends when its job is gone without an exit code (the loop checks that the job is alive).
+sandbox() { sh -c 'kill -9 $PPID'; sleep 10; }
+ga_t0="$(date +%s)"; out="$( (set -e; cmd_run --max-timeout 6 ga) 2>&1)"; rc=$?; el="$(ga_secs)"
+reload_hutch
+check "B2: a run whose job died ends at once with the job's status" '[[ $rc -eq 137 && $el -lt 5 ]]'
+
+# Minor: a limit of 0 means no limit, as with coreutils timeout.
+sandbox() { printf '%s\n' "${SANDBOX_CMD[*]}" >"$tmp/ga_cmd"; sleep 1.5; return 0; }
+out="$( (cmd_run --max-timeout 0 ga) 2>&1)"; rc=$?
+check "minor: --max-timeout 0 runs with no limit" '[[ $rc -eq 0 && "$(cat "$tmp/ga_cmd")" == "timeout -k 30 0 opencode run "* ]]'
+out="$( (HUTCH_RUN_TIMEOUT=0 cmd_run ga) 2>&1)"; rc=$?
+reload_hutch
+check "minor: run_timeout=0 runs with no limit" '[[ $rc -eq 0 ]]'
+
 echo "failures: $fails"
 [[ $fails -eq 0 ]]

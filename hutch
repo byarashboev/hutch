@@ -1329,6 +1329,13 @@ stop_sandbox_run() {
     kill "$job_pid" 2>/dev/null || true
     wait "$job_pid" 2>/dev/null || true
   fi
+  # A job killed while gate_up runs can miss its gate, which holds the key: remove this run's gates by name
+  # (hutch-gate-<project>-<task>-<pid>-, as sandbox names them).
+  if [[ -n "$ctr" ]] && command -v docker >/dev/null 2>&1; then
+    local gate_prefix g
+    gate_prefix="hutch-gate-${ctr#hutch-run-}"; gate_prefix="${gate_prefix%-*}-"
+    for g in $(docker ps -aq --filter "name=$gate_prefix" 2>/dev/null); do docker rm -f "$g" >/dev/null 2>&1 || true; done
+  fi
 }
 
 handle_watchdog_action() {
@@ -1415,6 +1422,9 @@ cmd_run() {
 
   msg="$(kickoff "$task")"
   /bin/rm -f "$out/tail.pid" "$out/exit.code" "$out/needs-scope.txt" "$out/abort.log" "$out/watchdog.detail"
+  # A scope request belongs to the run that wrote it; a leftover one would stop every later run at once.
+  /bin/rm -rf "$dir/repo/.hutch-needs-scope"
+  [[ -L "$out/sandbox" ]] || /bin/rm -rf "$out/sandbox/.hutch-needs-scope"
   # A later phase keeps the earlier phase's log.
   [[ -s "$out/run.jsonl" ]] && /bin/mv -f "$out/run.jsonl" "$out/run.$(date +%Y%m%d%H%M%S).jsonl"
   : >"$out/run.jsonl"
@@ -1428,8 +1438,9 @@ cmd_run() {
     : >"$steer"
     SANDBOX_CMD=(timeout -k 30 "$limit" opencode run --standalone --auto --format json --title "$task" "$msg")
     (
-      sandbox "$task" >"$out/run.jsonl" 2>"$out/run.err"
-      echo $? >"$out/exit.code"
+      rc=0
+      sandbox "$task" >"$out/run.jsonl" 2>"$out/run.err" || rc=$?
+      echo "$rc" >"$out/exit.code"
     ) </dev/null >/dev/null 2>&1 &
     job=$!
   else
@@ -1439,17 +1450,20 @@ cmd_run() {
     (
       set +o pipefail
       sh -c 'echo $$ >"$1"; exec tail -n +1 -f "$2"' _ "$out/tail.pid" "$steer" |
-        { sandbox "$task" -i >"$out/run.jsonl" 2>"$out/run.err"; echo $? >"$out/exit.code"; }
+        { rc=0; sandbox "$task" -i >"$out/run.jsonl" 2>"$out/run.err" || rc=$?; echo "$rc" >"$out/exit.code"; }
     ) >/dev/null 2>&1 &
     job=$!
-    until [[ -s "$out/tail.pid" || -f "$out/exit.code" ]]; do sleep 0.1; done
+    until [[ -s "$out/tail.pid" || -f "$out/exit.code" ]] || ! kill -0 "$job" 2>/dev/null; do sleep 0.1; done
     [[ -s "$out/tail.pid" ]] && tailpid="$(cat "$out/tail.pid")"
   fi
 
   local start_ts ticks=0 poll_s inspect_out action reason abort_rc=0
   start_ts="$(date +%s)"
   while :; do
-    inspect_out="$(watchdog_inspect "$out/run.jsonl" "$dir/repo" "$out" "$max_turns" "$loop_threshold")"
+    inspect_out="$(watchdog_inspect "$out/run.jsonl" "$dir/repo" "$out" "$max_turns" "$loop_threshold")" || {
+      stop_sandbox_run "$SANDBOX_CONTAINER" "$job" "$tailpid"
+      die "the watchdog failed, so the run was stopped"
+    }
     if [[ -n "$inspect_out" ]]; then
       action="$(printf '%s\n' "$inspect_out" | awk -F= '$1 == "ACTION" { print $2; exit }')"
       reason="$(printf '%s\n' "$inspect_out" | awk -F= '$1 == "REASON" { print substr($0, 8); exit }')"
@@ -1459,8 +1473,11 @@ cmd_run() {
       handle_watchdog_action "$action" "$reason" "$out" || abort_rc=$?
       return "$abort_rc"
     fi
-    if [[ -f "$out/exit.code" ]]; then break; fi
-    if (( $(date +%s) - start_ts >= limit )); then
+    # The run ends when the sandbox command has finished or its job is gone (exit.code is in a directory only hutch
+    # writes).
+    if [[ -f "$out/exit.code" ]] || ! kill -0 "$job" 2>/dev/null; then break; fi
+    # A limit of 0 means no limit, as with timeout.
+    if (( limit > 0 && $(date +%s) - start_ts >= limit )); then
       stop_sandbox_run "$SANDBOX_CONTAINER" "$job" "$tailpid"
       SANDBOX_CONTAINER=""
       /bin/rm -f "$out/tail.pid"
@@ -1478,7 +1495,10 @@ cmd_run() {
   done
 
   [[ -n "$tailpid" ]] && kill "$tailpid" 2>/dev/null || true
-  wait "$job" || true
+  local rc=0
+  wait "$job" || rc=$?
+  # The job writes the sandbox's exit code; a job that died before writing it leaves its own status.
+  if [[ -f "$out/exit.code" ]]; then rc="$(cat "$out/exit.code")"; else echo "$rc" >"$out/exit.code"; fi
   SANDBOX_CONTAINER=""
   /bin/rm -f "$out/tail.pid"
   inspect_out="$(watchdog_inspect "$out/run.jsonl" "$dir/repo" "$out" "$max_turns" "$loop_threshold")"
@@ -1488,8 +1508,6 @@ cmd_run() {
     handle_watchdog_action "$action" "$reason" "$out" || abort_rc=$?
     return "$abort_rc"
   fi
-  local rc
-  rc="$(cat "$out/exit.code" 2>/dev/null || echo 1)"
   echo "log: $out/run.jsonl (sandbox exit $rc)"
   [[ "$rc" == "$TIMED_OUT" ]] &&
     echo "hutch: the run hit its ${limit}s limit (HUTCH_RUN_TIMEOUT / run_timeout)" >&2
