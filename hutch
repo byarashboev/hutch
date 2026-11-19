@@ -684,6 +684,10 @@ overlay_cow_env() {
   echo "$out"
 }
 
+# overlay_cow_script is the container's entry wrapper for cow-tmpfs: it copies each read-only cache (/.hutch-ro/...) into
+# its tmpfs target with cp -a, so the copies are real files (Node resolves packages where they are, and files can be
+# changed in place) and the host directory stays untouched. Cost: the copy takes time at every start, and the tmpfs
+# lives in RAM: the copy and everything written to it count against the container's memory limit (memory=).
 overlay_cow_script() {
   cat <<'EOF'
 IFS='|' read -ra _hutch_pairs <<< "${HUTCH_COW_MOUNTS:-}"
@@ -691,7 +695,8 @@ for _hutch_p in "${_hutch_pairs[@]}"; do
   _hutch_src="${_hutch_p%%:*}"; _hutch_dst="${_hutch_p#*:}"
   if [ -d "$_hutch_src" ] && [ -n "$(ls -A "$_hutch_src" 2>/dev/null)" ]; then
     mkdir -p "$_hutch_dst"
-    cp -rPs "$_hutch_src/." "$_hutch_dst/" 2>/dev/null || cp -r "$_hutch_src/." "$_hutch_dst/"
+    cp -a "$_hutch_src/." "$_hutch_dst/" ||
+      { echo "hutch: copying the cache $_hutch_src to $_hutch_dst failed" >&2; exit 1; }
   fi
 done
 exec "$@"

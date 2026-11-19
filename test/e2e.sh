@@ -146,6 +146,29 @@ check "verify uses warm node_modules overlay offline and isolates writes from ho
 # Reset verify.sh & remove overlay for parallel test cleanly or keep overlay active.
 printf 'cd /work\nnode --test\n' >"$conf/verify.sh"
 
+# --- PR2 fixes: group D (cache overlays) ---
+# cow-tmpfs (the macOS default) copies the cache: a package that requires a hoisted sibling resolves, and a cached file
+# can be changed in place, while the host's node_modules stays as it was.
+mkdir -p "$repo/node_modules/demo-a" "$repo/node_modules/demo-b"
+printf 'module.exports = require("demo-b");\n' >"$repo/node_modules/demo-a/index.js"
+printf '{"name":"demo-a","main":"index.js"}\n' >"$repo/node_modules/demo-a/package.json"
+printf 'module.exports = 7;\n' >"$repo/node_modules/demo-b/index.js"
+printf '{"name":"demo-b","main":"index.js"}\n' >"$repo/node_modules/demo-b/package.json"
+cat >"$conf/verify.sh" <<'EOF'
+cd /work
+node -e 'if (require("demo-a") !== 7) process.exit(1)'
+echo 'module.exports = 8;' >/work/node_modules/demo-b/index.js
+node -e 'if (require("demo-a") !== 8) process.exit(1)'
+node --test
+EOF
+agent_task hoisted 'printf "export const h = 1;\n" >src/hoisted.js'
+rc=0; out="$(HUTCH_CACHE_OVERLAY_MODE=cow-tmpfs "$hutch" verify hoisted 2>&1)" || rc=$?
+check "cow-tmpfs resolves a hoisted dependency and changes a cached file without touching the host" '
+  [[ $rc -eq 0 && "$out" == *"verify passed"* && "$(cat "$repo/node_modules/demo-b/index.js")" == "module.exports = 7;" ]]
+'
+"$hutch" rm hoisted
+printf 'cd /work\nnode --test\n' >"$conf/verify.sh"
+
 # Workstream 5: Concurrent export & verify fan-out without collisions.
 agent_task par1 'printf "export const p1 = 1;\n" >src/p1.js'
 agent_task par2 'printf "export const p2 = 2;\n" >src/p2.js'

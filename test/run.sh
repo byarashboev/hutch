@@ -1063,5 +1063,12 @@ check "kv_get takes the last line of a key, so an appended setting overrides the
      -z "$(kv_get "$KVF" missing)" ]]
 '
 
+COWS="$tmp/cowsrc"; COWD="$tmp/cowdst"; mkdir -p "$COWS/pkg" "$COWD"; printf 'base\n' >"$COWS/pkg/index.js"
+HUTCH_COW_MOUNTS="$COWS:$COWD" bash -c "$(overlay_cow_script)" _ bash -c 'echo changed >"$1/pkg/index.js"' _ "$COWD"
+check "cow-tmpfs copies the cache as real files, so writes change the copy and never the source" '
+  [[ -f "$COWD/pkg/index.js" && ! -L "$COWD/pkg/index.js" && ! -L "$COWD/pkg" &&
+     "$(cat "$COWD/pkg/index.js")" == changed && "$(cat "$COWS/pkg/index.js")" == base ]]
+'
+
 echo "failures: $fails"
 [[ $fails -eq 0 ]]
