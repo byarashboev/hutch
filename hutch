@@ -1434,11 +1434,11 @@ stop_sandbox_run() {
   # gate, which holds the key, and its network: remove this run's gates and networks by name
   # (hutch-gate-<project>-<task>-<pid>- and hutch-net-..., as sandbox and gate_up name them).
   if [[ -n "$ctr" ]] && command -v docker >/dev/null 2>&1; then
-    local gate_prefix g
+    local run g
     docker rm -f "$ctr" >/dev/null 2>&1 || true
-    gate_prefix="hutch-gate-${ctr#hutch-run-}"; gate_prefix="${gate_prefix%-*}-"
-    for g in $(docker ps -aq --filter "name=$gate_prefix" 2>/dev/null); do docker rm -f "$g" >/dev/null 2>&1 || true; done
-    for g in $(docker network ls -q --filter "name=hutch-net-${gate_prefix#hutch-gate-}" 2>/dev/null); do
+    run="${ctr#hutch-run-}"; run="${run%-*}-"
+    for g in $(docker ps -aq --filter "name=hutch-gate-$run" 2>/dev/null); do docker rm -f "$g" >/dev/null 2>&1 || true; done
+    for g in $(docker network ls -q --filter "name=hutch-net-$run" 2>/dev/null); do
       docker network rm "$g" >/dev/null 2>&1 || true
     done
   fi
