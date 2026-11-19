@@ -411,14 +411,23 @@ pro_models() {
   echo "$pro"
 }
 
-# ran_strong succeeds when task $1 has run and every run used a strong model. cmd_run and cmd_say record each run's
-# model in the task directory, which the sandbox cannot write (it can write the out directory).
+# strong_model succeeds when MODEL is a model of a strong kind in the current model table.
+strong_model() { [[ "$(pro_models)" == *" $MODEL "* ]]; }
+
+# record_run appends MODEL to task $1's run-models with whether it counts as strong now, when it runs: verify may see
+# another provider's table, or an edited one. The task directory is one the sandbox cannot write (it writes out/).
+record_run() {
+  local strength=cheap
+  strong_model && strength=strong
+  echo "$MODEL $strength" >>"$(task_dir "$1")/run-models"
+}
+
+# ran_strong succeeds when task $1 has run and every run was recorded as strong (cmd_run, cmd_say, cmd_shell).
 ran_strong() {
-  local rec pro m
+  local rec m strength
   rec="$(task_dir "$1")/run-models"
   [[ -s "$rec" ]] || return 1
-  pro="$(pro_models)"
-  while IFS= read -r m; do [[ -n "$m" && "$pro" == *" $m "* ]] || return 1; done <"$rec"
+  while read -r m strength; do [[ -n "$m" && "$strength" == strong ]] || return 1; done <"$rec"
 }
 
 # pro_path succeeds when repository path $1 matches a pro-paths line.
@@ -432,7 +441,7 @@ need_pro_kind() {
   local dir reason
   dir="$(task_dir "$1")"
   reason="$(needs_pro "$dir/allow" "$dir/opened")" || return 0
-  [[ "$(pro_models)" == *" $MODEL "* ]] && return 0
+  strong_model && return 0
   die "task $1 $reason; run it with HUTCH_KIND set to one of: $PRO_KINDS (a strong model)"
 }
 
@@ -1534,7 +1543,7 @@ cmd_run() {
   [[ -s "$out/run.jsonl" ]] && /bin/mv -f "$out/run.jsonl" "$out/run.$(date +%Y%m%d%H%M%S).jsonl"
   : >"$out/run.jsonl"
   echo "$(date -u +%FT%TZ) agent=$AGENT provider=$PROVIDER kind=$KIND model=$MODEL small=$SMALL_MODEL phase=${HUTCH_PHASE:-}" >>"$out/models.log"
-  echo "$MODEL" >>"$dir/run-models"
+  record_run "$task"
 
   RUN_ID="$(rand_hex 4)"
   SANDBOX_CONTAINER="hutch-run-${NAME}-${task}-$$-${RUN_ID}"
@@ -1746,7 +1755,7 @@ cmd_say() {
   if [[ "$AGENT" == opencode ]]; then
     [[ -f "$out/exit.code" ]] || die "$1 has no finished run; opencode takes a follow-up only after the run stops"
     /bin/rm -f "$out/exit.code"
-    echo "$MODEL" >>"$(task_dir "$1")/run-models"
+    record_run "$1"
     SANDBOX_CMD=(timeout -k 30 "$(run_timeout)" opencode run --standalone --auto --format json --continue "$2")
     local rc=0
     sandbox "$1" >>"$out/run.jsonl" 2>>"$out/run.err" || rc=$?
@@ -1762,6 +1771,7 @@ cmd_say() {
 cmd_shell() {
   need_task "$1"
   need_models
+  record_run "$1"
   if [[ "$AGENT" == opencode ]]; then SANDBOX_CMD=(opencode --standalone --auto "${@:2}")
   else SANDBOX_CMD=(claude --dangerously-skip-permissions "${@:2}"); fi
   sandbox "$1" -it

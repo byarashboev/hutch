@@ -943,12 +943,12 @@ printf 'scope_mode=soft\n' >"$CONF/config"; printf 'billing/*\n' >"$CONF/pro-pat
 make_btask bpro 'printf "fee = 2\n" >billing/fees.py'
 out="$( (cmd_verify bpro) 2>&1)"; rc=$?
 check "M1: verify fails a pro-paths change when no run of the task is recorded" '[[ $rc -ne 0 && "$out" == *"PRO-PATH billing/fees.py"* ]]'
-echo deepseek-v4.1-flash >"$STATE/work/bpro/run-models"
+echo "deepseek-v4.1-flash cheap" >"$STATE/work/bpro/run-models"
 echo "x agent=opencode provider=opencode kind=design model=deepseek-v4-pro small=s phase=" >"$STATE/out/bpro/models.log"
 out="$( (cmd_verify bpro) 2>&1)"; rc=$?
 check "M1: verify fails a pro-paths change after a cheap run, even in soft scope and with a forged out/models.log" '
   [[ $rc -ne 0 && "$out" == *"PRO-PATH billing/fees.py"* ]]'
-printf 'deepseek-v4-pro\nkimi-k3\n' >"$STATE/work/bpro/run-models"
+printf 'deepseek-v4-pro strong\nkimi-k3 strong\n' >"$STATE/work/bpro/run-models"
 out="$( (cmd_verify --allow 'billing/*' bpro) 2>&1)"; rc=$?
 check "M1: verify passes a pro-paths change when every run used a strong model" '[[ $rc -eq 0 && "$out" == *"ok billing/fees.py"* ]]'
 
@@ -956,7 +956,7 @@ cmd_new brec "$tmp/ballow" "$tmp/vbrief" >/dev/null
 sandbox() { return 0; }
 (MODEL=glm-5.2 SMALL_MODEL=s AGENT=opencode; cmd_run brec; cmd_say brec more) >/dev/null 2>&1
 check "M1: run and opencode follow-ups record their model in the task directory" '
-  [[ "$(tr "\n" " " <"$STATE/work/brec/run-models")" == "glm-5.2 glm-5.2 " ]]'
+  [[ "$(tr "\n" " " <"$STATE/work/brec/run-models")" == "glm-5.2 cheap glm-5.2 cheap " ]]'
 
 CONF="$tmp/bdeny"; mkdir -p "$CONF"; : >"$CONF/protected"; : >"$CONF/config"
 bdeny_missing=""
@@ -1194,6 +1194,30 @@ check "N5: stale hutch networks are pruned before a run creates its network and 
   [[ -n "$r_prune_at" && -n "$r_create_at" && $r_prune_at -lt $r_create_at ]] &&
   [[ "$(grep -cxF -- "$r_prune" "$tmp/r_n5")" == 2 ]]'
 unset -f docker
+
+# N6: whether a run's model counted as strong is decided when it runs and recorded in the task directory; verify uses
+# that record, not the model table it finds later. A record without the decision fails closed; hutch shell records too.
+CONF="$tmp/bconf"; STATE="$tmp/bstate"; NAME=bproj; REPO="$BREPO"
+need_image() { return 0; }
+offline() { return 0; }
+printf 'design\tstrong-1\nquick\tcheap-1\nsmall\ts\n' >"$tmp/r_models_a.tsv"
+printf 'design\tcheap-1\nquick\tstrong-1\nsmall\ts\n' >"$tmp/r_models_b.tsv"
+make_btask rstrong 'printf "fee = 3\n" >billing/fees.py'
+make_btask rcheap 'printf "fee = 4\n" >billing/fees.py'
+(MODELS_FILE="$tmp/r_models_a.tsv" MODEL=strong-1 SMALL_MODEL=s; sandbox() { return 0; }; cmd_run rstrong) >/dev/null 2>&1
+(MODELS_FILE="$tmp/r_models_a.tsv" MODEL=cheap-1 SMALL_MODEL=s; sandbox() { return 0; }; cmd_run rcheap) >/dev/null 2>&1
+out="$( (MODELS_FILE="$tmp/r_models_b.tsv"; cmd_verify --allow 'billing/*' rstrong) 2>&1)"; rc=$?
+check "N6: a run recorded as strong passes a pro-paths change under another model table" '[[ $rc -eq 0 && "$out" != *PRO-PATH* ]]'
+out="$( (MODELS_FILE="$tmp/r_models_b.tsv"; cmd_verify --allow 'billing/*' rcheap) 2>&1)"; rc=$?
+check "N6: a run recorded as cheap fails a pro-paths change even when the table now calls its model strong" '
+  [[ $rc -ne 0 && "$out" == *"PRO-PATH billing/fees.py"* ]]'
+echo strong-1 >"$STATE/work/rstrong/run-models"
+out="$( (MODELS_FILE="$tmp/r_models_a.tsv"; cmd_verify --allow 'billing/*' rstrong) 2>&1)"; rc=$?
+check "N6: a run record without the strong/cheap decision fails closed" '[[ $rc -ne 0 && "$out" == *"PRO-PATH billing/fees.py"* ]]'
+: >"$STATE/work/rcheap/run-models"
+(MODELS_FILE="$tmp/r_models_a.tsv" MODEL=cheap-1 SMALL_MODEL=s; sandbox() { return 0; }; cmd_shell rcheap) >/dev/null 2>&1
+check "N6: hutch shell records its model as a run" '[[ "$(cat "$STATE/work/rcheap/run-models")" == "cheap-1 cheap" ]]'
+unset -f need_image offline
 
 reload_hutch
 CONF="${r_saved[0]}" STATE="${r_saved[1]}" NAME="${r_saved[2]}" REPO="${r_saved[3]}" PROJECT_IMAGE="${r_saved[4]}"

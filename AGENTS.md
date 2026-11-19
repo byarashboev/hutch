@@ -180,7 +180,8 @@ Ask these questions together, each with your drafted answer and the reason for i
       `--allow <glob>` to promote a path. With `--soft-scope` (or `scope_mode=soft`), non-protected source edits outside
       `--allow` pass with a **`WARN: UNSCOPED_PATHS`** section and diff stat (saved to `unscoped.txt`) for senior review.
     - Files matching `pro-paths` fail verification unless every run of the task used a strong kind (`design`/`concurrency`;
-      recorded in `work/<task>/run-models`; a task with no record fails closed).
+      decided when each run, follow-up or shell starts and recorded in `work/<task>/run-models`, so a later change of
+      provider or model table does not change it; a task with no record fails closed).
     - Lists added comment lines, names changes to existing tests, and runs `verify.sh` offline with read-only base overlays.
 11. `hutch report <task>` gives the model, usage, commits, verify status, test changes, `WARN: UNSCOPED_PATHS`, and
     requested scope escalations in one page (`report.md`); start the review from it.
