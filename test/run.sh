@@ -1219,6 +1219,21 @@ check "N6: a run record without the strong/cheap decision fails closed" '[[ $rc 
 check "N6: hutch shell records its model as a run" '[[ "$(cat "$STATE/work/rcheap/run-models")" == "cheap-1 cheap" ]]'
 unset -f need_image offline
 
+# N7: stop_sandbox_run removes the container again once the job is gone (the job may have created it after the first
+# removal), and a signal that comes after the job started but before RUN_JOB was set still stops the job.
+sleep 30 & r_job=$!
+docker() { echo "$* $(kill -0 "$r_job" 2>/dev/null && echo alive || echo gone)" >>"$tmp/r_n7"; }
+: >"$tmp/r_n7"
+stop_sandbox_run hutch-run-rproj-ra-1-ab "$r_job" ""
+check "N7: the run's container is removed again after its job has ended" 'grep -qx "rm -f hutch-run-rproj-ra-1-ab gone" "$tmp/r_n7"'
+unset -f docker
+mkdir -p "$tmp/r_n7out"
+(RUN_JOB=""; RUN_TAIL=""; SANDBOX_CONTAINER=""; RUN_OUT="$tmp/r_n7out"; RUN_BANG="$(last_job)"
+  sleep 30 & echo $! >"$tmp/r_n7out/pid"; run_interrupted 143) >/dev/null 2>&1
+r_pid="$(cat "$tmp/r_n7out/pid")"
+check "N7: a job started just before the signal, not yet in RUN_JOB, is stopped" '! kill -0 "$r_pid" 2>/dev/null'
+kill "$r_pid" 2>/dev/null
+
 reload_hutch
 CONF="${r_saved[0]}" STATE="${r_saved[1]}" NAME="${r_saved[2]}" REPO="${r_saved[3]}" PROJECT_IMAGE="${r_saved[4]}"
 

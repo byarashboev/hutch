@@ -1429,10 +1429,12 @@ stop_sandbox_run() {
     kill "$job_pid" 2>/dev/null || true
     wait "$job_pid" 2>/dev/null || true
   fi
-  # A job killed while gate_up runs can miss its gate, which holds the key, and its network: remove this run's gates
-  # and networks by name (hutch-gate-<project>-<task>-<pid>- and hutch-net-..., as sandbox and gate_up name them).
+  # The job may have created the container after the first removal. A job killed while gate_up runs can miss its
+  # gate, which holds the key, and its network: remove this run's gates and networks by name
+  # (hutch-gate-<project>-<task>-<pid>- and hutch-net-..., as sandbox and gate_up name them).
   if [[ -n "$ctr" ]] && command -v docker >/dev/null 2>&1; then
     local gate_prefix g
+    docker rm -f "$ctr" >/dev/null 2>&1 || true
     gate_prefix="hutch-gate-${ctr#hutch-run-}"; gate_prefix="${gate_prefix%-*}-"
     for g in $(docker ps -aq --filter "name=$gate_prefix" 2>/dev/null); do docker rm -f "$g" >/dev/null 2>&1 || true; done
     for g in $(docker network ls -q --filter "name=hutch-net-${gate_prefix#hutch-gate-}" 2>/dev/null); do
@@ -1441,12 +1443,18 @@ stop_sandbox_run() {
   fi
 }
 
+# last_job prints $!, the last job this shell started, or nothing (bash 3.2 under set -u rejects ${!:-}).
+last_job() ( set +u; echo "$!" )
+
 # run_interrupted stops the running sandbox (RUN_JOB, RUN_TAIL, SANDBOX_CONTAINER) when hutch run gets INT or TERM, and
 # records the signal's exit code in RUN_OUT.
 run_interrupted() {
   # Ignored, not reset: a second signal (batch's TERM after Ctrl-C, or a second Ctrl-C) must not end the cleanup.
   trap '' INT TERM
-  stop_sandbox_run "${SANDBOX_CONTAINER:-}" "${RUN_JOB:-}" "${RUN_TAIL:-}"
+  local job="${RUN_JOB:-}"
+  # A signal right after the job started, before RUN_JOB was set: $! already names it.
+  [[ -n "$job" || "$(last_job)" == "${RUN_BANG:-}" ]] || job="$(last_job)"
+  stop_sandbox_run "${SANDBOX_CONTAINER:-}" "$job" "${RUN_TAIL:-}"
   echo "$1" >"$RUN_OUT/exit.code"
   echo "hutch: the run was interrupted and its sandbox stopped" >&2
   exit "$1"
@@ -1549,7 +1557,7 @@ cmd_run() {
   SANDBOX_CONTAINER="hutch-run-${NAME}-${task}-$$-${RUN_ID}"
   local job
   # Ctrl-C or hutch batch stopping this run also stops its sandbox and gate.
-  RUN_JOB=""; RUN_TAIL=""; RUN_OUT="$out"
+  RUN_JOB=""; RUN_TAIL=""; RUN_OUT="$out"; RUN_BANG="$(last_job)"
   trap 'run_interrupted 130' INT
   trap 'run_interrupted 143' TERM
   if [[ "$AGENT" == opencode ]]; then
