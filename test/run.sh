@@ -731,5 +731,48 @@ check "cmd_batch --max-parallel 2 exits 0 when all tasks succeed" '
   [[ $rc -eq 0 && "$out" == *"bt1"* && "$out" == *"bt2"* && "$out" == *"bt3"* ]]
 '
 
+# --- PR2 fixes: group A (run + watchdog) ---
+MODEL=m SMALL_MODEL=s AGENT=opencode
+: >"$CONF/config"
+cmd_new ga --allow 'src/*.ts' --brief "$tmp/vbrief" >/dev/null
+GA_OUT="$STATE/out/ga"; GA_REPO="$STATE/work/ga/repo"
+export HUTCH_WATCHDOG_POLL=0.1
+
+# B1: /out is the sandbox subdirectory; the files hutch writes are in a directory no container sees.
+docker() {
+  local sub="$1"; shift
+  case "$sub" in
+    run) [[ " $* " == *" $GATE_IMAGE "* ]] || printf '%s\n' "$@" >"$tmp/ga_sbx" ;;
+    inspect) echo "172.30.0.3" ;;
+  esac
+  return 0
+}
+need_image() { return 0; }
+HUTCH_API_KEY=sk-ga SANDBOX_CMD=(true) sandbox ga >/dev/null
+check "B1: the sandbox gets out/<task>/sandbox as /out, never out/<task>" '
+  grep -qxF "$GA_OUT/sandbox:/out" "$tmp/ga_sbx" && ! grep -qxF "$GA_OUT:/out" "$tmp/ga_sbx" && [[ -d "$GA_OUT/sandbox" ]]'
+mkdir -p "$tmp/ga_elsewhere"; mv "$GA_OUT/sandbox" "$tmp/ga_sbxdir"; ln -s "$tmp/ga_elsewhere" "$GA_OUT/sandbox"
+out="$( (HUTCH_API_KEY=sk-ga SANDBOX_CMD=(true) sandbox ga) 2>&1)"; rc=$?
+rm "$GA_OUT/sandbox"; mv "$tmp/ga_sbxdir" "$GA_OUT/sandbox"
+check "B1: the sandbox refuses a symlinked out/<task>/sandbox" '[[ $rc -ne 0 && "$out" == *"is a symlink"* ]]'
+
+# B1: export runs git in a container that writes to an empty directory, then moves the bundle in.
+docker() {
+  local a prev=""
+  for a in "$@"; do
+    if [[ "$prev" == -v && "$a" == *:/out ]]; then
+      printf '%s\n' "${a%:/out}" >"$tmp/ga_export_mount"; echo bundle >"${a%:/out}/ga.bundle"
+    fi
+    prev="$a"
+  done
+}
+cmd_export ga
+check "B1: export never mounts the output directory and leaves the bundle there" '
+  [[ "$(cat "$tmp/ga_export_mount")" == "$STATE/work/ga/export" && "$(cat "$GA_OUT/ga.bundle")" == bundle &&
+     ! -e "$STATE/work/ga/export" ]]'
+
+unset -f docker need_image
+reload_hutch
+
 echo "failures: $fails"
 [[ $fails -eq 0 ]]

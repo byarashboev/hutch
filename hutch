@@ -681,6 +681,10 @@ sandbox() {
   local dir out gate url probe proxy_token agent_args extra
   dir="$(task_dir "$task")"; out="$(out_dir "$task")"
   [[ -f "$CONF/primer.md" ]] || die "missing $CONF/primer.md"
+  # /out is a subdirectory: the sandbox can put symlinks in any directory it writes, so the files hutch writes
+  # (logs, exit code, reports) live in the parent, which no container sees.
+  [[ ! -L "$out/sandbox" ]] || die "$out/sandbox is a symlink; remove it"
+  mkdir -p "$out/sandbox"
   need_image "$PROJECT_IMAGE"
   need_image "$GATE_IMAGE"
   # Model names go into opencode.json; brackets stay allowed for names such as deepseek-v4-pro[1m].
@@ -730,7 +734,7 @@ sandbox() {
     --network "$NET_INTERNAL" --cap-drop ALL --security-opt no-new-privileges \
     ${RUNTIME:+--runtime "$RUNTIME"} $(limit_args) --tmpfs /tmp:exec,size=4g \
     -v "$dir/repo:/work" -v "$dir/brief.md:/task/brief.md:ro" -v "$CONF/primer.md:/task/primer.md:ro" \
-    -v "${HUTCH_DIR}/rules/checklist.md:/task/checklist.md:ro" -v "$out:/out" \
+    -v "${HUTCH_DIR}/rules/checklist.md:/task/checklist.md:ro" -v "$out/sandbox:/out" \
     ${extra[@]+"${extra[@]}"} ${OVERLAY_DOCKER_ARGS[@]+"${OVERLAY_DOCKER_ARGS[@]}"} "${agent_args[@]}" \
     ${cow_args[@]+"${cow_args[@]}"} \
     -e HUTCH_PROXY_TOKEN="$proxy_token" -e HUTCH_PROBE_URL="$probe" -e HUTCH_GATE="$url" \
@@ -1625,10 +1629,15 @@ cmd_export() {
   need_task "$1"
   local dir; dir="$(task_dir "$1")"
   need_image "$PROJECT_IMAGE"
-  # git runs in a network-less container, so hooks or config the agent wrote never run on the host.
-  docker run --rm --network none --cap-drop ALL ${RUNTIME:+--runtime "$RUNTIME"} -v "$dir/repo:/work:ro" -v "$(out_dir "$1"):/out" \
+  # git runs in a network-less container, so hooks or config the agent wrote never run on the host. It writes to an
+  # empty directory, not to the output directory, so it cannot leave symlinks among the files hutch writes.
+  /bin/rm -rf "$dir/export"; mkdir "$dir/export"
+  docker run --rm --network none --cap-drop ALL ${RUNTIME:+--runtime "$RUNTIME"} -v "$dir/repo:/work:ro" -v "$dir/export:/out" \
     -e GIT_CONFIG_NOSYSTEM=1 "$PROJECT_IMAGE" \
     git -c core.hooksPath=/dev/null -c safe.directory=/work bundle create "/out/$1.bundle" "$(cat "$dir/base")..hutch/$1"
+  [[ -f "$dir/export/$1.bundle" && ! -L "$dir/export/$1.bundle" ]] || die "export wrote no bundle"
+  /bin/mv -f "$dir/export/$1.bundle" "$(out_dir "$1")/$1.bundle"
+  /bin/rm -rf "$dir/export"
 }
 
 cmd_verify() {
@@ -1817,8 +1826,8 @@ cmd_report() {
     echo "## To review"
     echo
     local f
-    for f in self-review.md design-notes.md verify.log run.err gate.log abort.log needs-scope.txt; do
-      [[ -s "$out/$f" ]] && echo "- $out/$f"
+    for f in sandbox/self-review.md sandbox/design-notes.md verify.log run.err gate.log abort.log needs-scope.txt; do
+      [[ -s "$out/$f" && ! -L "$out/$f" ]] && echo "- $out/$f"
     done
     echo "- git -C $REPO diff $base $ref"
   } | tee "$out/report.md"
