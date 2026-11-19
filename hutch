@@ -522,9 +522,10 @@ gate_up() {
   local name="$1" conf="$2" key proxy_token _
   proxy_token="${5:-$(gen_proxy_token)}"
   key="$(api_key)"
-  if ! python3 -I -c 'import sys; k = sys.argv[1]; sys.exit(0 if k and all(32 < ord(c) < 127 and c not in "\"\\;" for c in k) else 1)' "$key"; then
-    die "API key contains unsafe characters for gate configuration"
-  fi
+  # Checked in bash, so the key never appears in a process's arguments. envsubst puts it into quoted nginx strings,
+  # so only characters that cannot end the string, escape or start a variable ($) are allowed.
+  (LC_ALL=C; [[ "$key" =~ ^[A-Za-z0-9._~+/=:-]+$ ]]) ||
+    die "API key contains unsafe characters for gate configuration (allowed: letters, digits and ._~+/=:-)"
   gate_conf >"$conf"
   GATE_NAME="$name"; GATE_LOG="$3"
   HUTCH_KEY="$key" HUTCH_PROXY_TOKEN="$proxy_token" docker run -d --rm --name "$name" --network "$NET_EGRESS" --cap-drop ALL \

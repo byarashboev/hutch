@@ -971,5 +971,39 @@ check "minor: default test pattern matches Tests/ directories and *Test.php file
 unset -f need_image offline
 reload_hutch
 
+# --- PR2 fixes: group C (gate, key, networks) ---
+# docker stub: logs every call; with GC_GATE_FAIL the gate has no address, so gate_up stops after creating the network.
+docker() {
+  local sub="$1"; shift
+  printf '%s %s\n' "$sub" "$*" >>"$tmp/gc_docker"
+  case "$sub" in
+    inspect) [[ -n "${GC_GATE_FAIL:-}" ]] || echo "172.30.0.7" ;;
+    *) return 0 ;;
+  esac
+}
+need_image() { return 0; }
+mkdir -p "$tmp/gcbin"
+for c in python3 python perl; do
+  printf '#!/bin/sh\necho "$0 $*" >>"%s/gc_argv"\n' "$tmp" >"$tmp/gcbin/$c"; chmod +x "$tmp/gcbin/$c"
+done
+: >"$tmp/gc_docker"
+out="$( (PATH="$tmp/gcbin:$PATH"; HUTCH_API_KEY="sk-ant-api03-Gc_key-123+/=" gate_up hutch-gate-gc1 "$tmp/gc.conf" "$tmp/gc.log" gctask tok) 2>&1)"; rc=$?
+check "gate_up checks the API key without putting it in any process's arguments" '
+  [[ $rc -eq 0 && ! -e "$tmp/gc_argv" && -s "$tmp/gc_docker" && "$(cat "$tmp/gc_docker")" != *Gc_key* ]]'
+
+gc_bad=""
+for k in 'sk-$host' 'sk-${HUTCH_PROXY_TOKEN}' 'a b' 'a"b' 'a\b' 'a;b' 'a{b' 'a}b' "a'b" $'a\tb' $'a\nb' $'sk\xc3\xa9x'; do
+  : >"$tmp/gc_docker"
+  if (HUTCH_API_KEY="$k" gate_up hutch-gate-gc2 "$tmp/gc.conf" "$tmp/gc.log" gctask tok) >/dev/null 2>&1 ||
+     [[ -s "$tmp/gc_docker" ]]; then gc_bad="$gc_bad [$k]"; fi
+done
+for k in sk-ant-api03-AbC_d-1 'abc+/=' eyJh.eyJ.sig 'id:secret~1'; do
+  (HUTCH_API_KEY="$k" gate_up hutch-gate-gc2 "$tmp/gc.conf" "$tmp/gc.log" gctask tok) >/dev/null 2>&1 || gc_bad="$gc_bad refused[$k]"
+done
+check "gate_up refuses keys with \$, quotes, backslashes, braces, ; or whitespace and accepts token-like keys" '[[ -z "$gc_bad" ]] || { echo "    $gc_bad"; false; }'
+
+unset -f docker need_image
+reload_hutch
+
 echo "failures: $fails"
 [[ $fails -eq 0 ]]
