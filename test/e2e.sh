@@ -38,6 +38,8 @@ cd "$repo"
 
 "$hutch" init >/dev/null
 conf="$HUTCH_HOME/projects/e2e-demo"
+# The checks below cover soft scope; the template's default is strict.
+sed 's/^scope_mode=.*/scope_mode=soft/' "$conf/config" >"$tmp/config" && mv "$tmp/config" "$conf/config"
 printf 'ARG HUTCH_BASE=hutch-base:latest\nFROM ${HUTCH_BASE}\nUSER hutch\nWORKDIR /work\n' >"$conf/Dockerfile"
 printf 'cd /work\nnode --test\n' >"$conf/verify.sh"
 printf '# e2e primer\n' >"$conf/primer.md"
