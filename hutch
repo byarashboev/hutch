@@ -349,7 +349,7 @@ test_changes() {
   re="$(test_regex)"
   policy="$(conf_get tests_policy)"; policy="${policy:-report}"
   [[ "$policy" == report || "$policy" == append-only ]] || die "tests_policy must be report or append-only"
-  while IFS=$'\t' read -r st f; do
+  while IFS= read -r -d '' st && IFS= read -r -d '' f; do
     if [[ -z "$f" ]] || ! grep -qE -- "$re" <<<"$f"; then continue; fi
     case "$st" in
       D) echo "DELETED $f"; bad=1; continue ;;
@@ -363,7 +363,7 @@ test_changes() {
       while IFS= read -r n; do echo "SKIP $f: ${n#+}"; done <<<"$skips"
       bad=1
     fi
-  done < <(git -C "$REPO" diff --name-status --no-renames "$base" "$ref")
+  done < <(git -C "$REPO" -c core.quotePath=false diff --name-status --no-renames -z "$base" "$ref")
   [[ $bad -eq 1 ]] || echo "(no changes to existing tests)"
   [[ "$policy" == append-only && $bad -eq 1 ]] && return 1
   return 0
@@ -1698,8 +1698,8 @@ cmd_verify() {
     esac
   done
   need_task "$task"
-  local dir out base ref bundle heads files f bad=0 tree mode
-  local -a unscoped=()
+  local dir out base ref bundle heads f bad=0 tree mode
+  local -a files=() unscoped=()
   dir="$(task_dir "$task")"; out="$(out_dir "$task")"; base="$(cat "$dir/base")"; ref="refs/hutch/$task"
   bundle="$out/$task.bundle"
   mode="$(scope_mode "$mode_arg")"
@@ -1722,16 +1722,17 @@ cmd_verify() {
   git -C "$REPO" merge-base --is-ancestor "$base" "$ref" || vfail "$ref does not build on $base"
   echo "== commits"; git -C "$REPO" log --oneline "$base..$ref"
   echo "== files (scope=$mode)"
-  files="$(git -C "$REPO" diff --name-only "$base" "$ref")"
-  while IFS= read -r f; do
-    [[ -z "$f" ]] && continue
+  # Unquoted, NUL-separated and without rename detection: a moved file counts as deleted at its old path, so moving a
+  # protected file or an existing test is caught, and a non-ASCII name is checked as it is, not as a quoted string.
+  while IFS= read -r -d '' f; do files+=("$f"); done < <(git -C "$REPO" -c core.quotePath=false diff --no-renames -z --name-only "$base" "$ref")
+  for f in ${files[@]+"${files[@]}"}; do
     if protected "$f"; then echo "PROTECTED $f"; bad=1
     elif [[ $allow_tests -ne 1 ]] && is_preexisting_test "$base" "$f"; then
       echo "PROTECTED-TEST $f (pre-existing test; pass --allow-tests to permit)"; bad=1
     elif allowed "$f"; then echo "ok $f"
     elif [[ "$mode" == soft ]]; then echo "UNSCOPED $f"; unscoped+=("$f")
     else echo "NOT-ALLOWED $f"; bad=1; fi
-  done <<<"$files"
+  done
   if [[ ${#unscoped[@]} -gt 0 ]]; then
     echo "== WARN: UNSCOPED_PATHS"
     for f in "${unscoped[@]}"; do echo "UNSCOPED $f"; done
@@ -1754,7 +1755,7 @@ cmd_verify() {
   # The checks run the agent's code, so they run offline in a fresh container from a plain tree.
   tree="$out/tree"; /bin/rm -rf "$tree"; mkdir -p "$tree"
   git -C "$REPO" archive "$ref" | tar -x -C "$tree"
-  printf '%s\n' "$files" >"$out/changed.txt"
+  printf '%s\n' ${files[@]+"${files[@]}"} >"$out/changed.txt"
   echo "== checks (offline container)"
   local limit rc=0
   limit="$(verify_timeout)"

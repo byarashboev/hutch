@@ -888,5 +888,51 @@ check "minor: batch on TERM stops every run, kills their sandboxes and prints th
   ! kill -0 "$(cat "$tmp/ga_sleep_ga")" 2>/dev/null && ! kill -0 "$(cat "$tmp/ga_sleep_gb")" 2>/dev/null'
 unset HUTCH_WATCHDOG_POLL
 
+# --- PR2 fixes: group B (verify) ---
+BREPO="$tmp/brepo"; git init -q -b main "$BREPO"
+mkdir -p "$BREPO/src" "$BREPO/tests" "$BREPO/.github/workflows" "$BREPO/billing"
+printf 'a = 1\n' >"$BREPO/src/a.py"
+printf 'def test_a():\n    pass\n' >"$BREPO/tests/test_a.py"
+printf 'def test_b():\n    pass\n' >"$BREPO/tests/tëst_b.py"
+printf '{}\n' >"$BREPO/package.json"
+printf 'on: push\n' >"$BREPO/.github/workflows/ci.yml"
+printf 'fee = 1\n' >"$BREPO/billing/fees.py"
+git -C "$BREPO" add -A; git -C "$BREPO" -c user.name=t -c user.email=t@t commit -qm base
+bbase="$(git -C "$BREPO" rev-parse HEAD)"
+CONF="$tmp/bconf"; mkdir -p "$CONF"
+printf 'scope_mode=soft\n' >"$CONF/config"; : >"$CONF/protected"; : >"$CONF/openable"; printf 'true\n' >"$CONF/verify.sh"
+STATE="$tmp/bstate"; NAME=bproj; REPO="$BREPO"; PROJECT_IMAGE="hutch-bproj:latest"
+printf 'src/*\n' >"$tmp/ballow"
+make_btask() {
+  local t="$1" script="$2"
+  cmd_new "$t" "$tmp/ballow" "$tmp/vbrief" >/dev/null
+  (cd "$STATE/work/$t/repo" && eval "$script" && git add -A && git commit -qm "agent: $t")
+  git -C "$STATE/work/$t/repo" bundle create "$STATE/out/$t/$t.bundle" "${bbase}..hutch/$t" >/dev/null 2>&1
+}
+need_image() { return 0; }
+offline() { return 0; }
+
+make_btask bquote 'printf "x\n" >.github/workflows/déploy.yml'
+out="$( (cmd_verify bquote) 2>&1)"; rc=$?
+check "B4: verify rejects a protected path with a non-ASCII name (no quoted paths)" '
+  [[ $rc -ne 0 && "$out" == *"PROTECTED .github/workflows/déploy.yml"* ]]'
+
+make_btask brentest 'git mv tests/test_a.py src/old_a.py'
+out="$( (cmd_verify --strict-scope brentest) 2>&1)"; rc=$?
+check "B4: verify counts a renamed existing test as its deletion (PROTECTED-TEST)" '
+  [[ $rc -ne 0 && "$out" == *"PROTECTED-TEST tests/test_a.py"* && "$out" == *"ok src/old_a.py"* ]]'
+
+make_btask brenprot 'git mv package.json src/pkg.json && git mv .github/workflows/ci.yml src/ci.yml'
+out="$( (cmd_verify --strict-scope brenprot) 2>&1)"; rc=$?
+check "B4: verify rejects moving protected files into an allowed directory" '
+  [[ $rc -ne 0 && "$out" == *"PROTECTED package.json"* && "$out" == *"PROTECTED .github/workflows/ci.yml"* ]]'
+
+make_btask bedittest 'printf "def test_b():\n" >tests/tëst_b.py'
+out="$( (cmd_verify --allow-tests bedittest) 2>&1)"; rc=$?
+check "B4: test changes name an edited test with a non-ASCII name" '[[ "$out" == *"EDITED tests/tëst_b.py (-1)"* ]]'
+
+unset -f need_image offline
+reload_hutch
+
 echo "failures: $fails"
 [[ $fails -eq 0 ]]
