@@ -188,8 +188,8 @@ patterns() { [[ -f "$1" ]] || return 0; grep -v -e '^[[:space:]]*$' -e '^#' "$1"
 # ---- path rules ------------------------------------------------------------------------------------------------
 
 # Paths the agent may never change, whatever the project or task says: the project's hutch config itself, git
-# metadata, CI configs, dependency manifests/lockfiles, build scripts, env/secret files, and every .gitattributes
-# (because verify checks a git archive of the task branch and export-ignore in any directory would hide files).
+# metadata, CI configs, dependency manifests/lockfiles, package-manager and git-hook configs, build scripts, test
+# runner configs, env/secret files, and every .gitattributes (because verify checks a git archive of the task branch and export-ignore in any directory would hide files).
 ALWAYS_PROTECTED='.hutch/*
 .git
 .git/*
@@ -239,11 +239,43 @@ Pipfile.lock
 requirements*.txt
 */requirements*.txt
 Gemfile
+*/Gemfile
 Gemfile.lock
+*/Gemfile.lock
 composer.json
+*/composer.json
 composer.lock
+*/composer.lock
+go.work
+*/go.work
+go.work.sum
+*/go.work.sum
+setup.py
+*/setup.py
+setup.cfg
+*/setup.cfg
+pom.xml
+*/pom.xml
+build.gradle*
+*/build.gradle*
+settings.gradle*
+*/settings.gradle*
+.npmrc
+*/.npmrc
+.yarnrc*
+*/.yarnrc*
+.husky/*
+*/.husky/*
+pytest.ini
+*/pytest.ini
+jest.config.*
+*/jest.config.*
+conftest.py
+*/conftest.py
 Makefile
 */Makefile
+makefile
+*/makefile
 GNUmakefile
 */GNUmakefile
 Dockerfile
@@ -252,9 +284,13 @@ Dockerfile.*
 */Dockerfile.*
 *.Dockerfile
 compose.yaml
+*/compose.yaml
 compose.yml
+*/compose.yml
 docker-compose*.yml
+*/docker-compose*.yml
 docker-compose*.yaml
+*/docker-compose*.yaml
 .env
 .env.*
 .env*
@@ -321,7 +357,7 @@ needs_pro() {
 }
 
 # Test files when the project config has no tests= pattern (an ERE over repository paths).
-DEFAULT_TESTS='(^|/)(tests?|__tests__|specs?)/|[._-](test|spec)\.[A-Za-z0-9]+$|_test\.go$|(^|/)test_[^/]*\.py$'
+DEFAULT_TESTS='(^|/)(tests?|Tests|__tests__|specs?)/|[._-](test|spec)\.[A-Za-z0-9]+$|Test\.php$|_test\.go$|(^|/)test_[^/]*\.py$'
 # Added lines that skip or focus tests, in the common frameworks.
 SKIP_MARKERS='\.(skip|only|todo)\(|(^|[^A-Za-z0-9_])(xit|xdescribe|xtest|fit|fdescribe)\(|t\.Skip|@pytest\.mark\.(skip|xfail)|@unittest\.skip|@Disabled|@Ignore|#\[ignore\]'
 

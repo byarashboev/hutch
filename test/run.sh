@@ -953,6 +953,21 @@ sandbox() { return 0; }
 check "M1: run and opencode follow-ups record their model in the task directory" '
   [[ "$(tr "\n" " " <"$STATE/work/brec/run-models")" == "glm-5.2 glm-5.2 " ]]'
 
+CONF="$tmp/bdeny"; mkdir -p "$CONF"; : >"$CONF/protected"; : >"$CONF/config"
+bdeny_missing=""
+for p in makefile sub/makefile GNUmakefile sub/GNUmakefile composer.json a/b/composer.json a/composer.lock \
+  Gemfile sub/Gemfile Gemfile.lock sub/Gemfile.lock compose.yaml sub/compose.yml docker-compose.yml \
+  sub/docker-compose.yaml .npmrc sub/.npmrc .yarnrc .yarnrc.yml sub/.yarnrc.yml .husky/pre-commit sub/.husky/pre-push \
+  go.work go.work.sum sub/go.work setup.py sub/setup.cfg pom.xml sub/pom.xml build.gradle sub/build.gradle.kts \
+  settings.gradle sub/settings.gradle.kts pytest.ini sub/pytest.ini jest.config.js sub/jest.config.ts \
+  conftest.py tests/conftest.py; do
+  protected "$p" || bdeny_missing+="$p "
+done
+check "minor: hard denylist covers more build, manifest and test-config files at any depth (missing: $bdeny_missing)" '
+  [[ -z "$bdeny_missing" ]] && ! protected src/setup_helpers.py && ! protected src/pom.xml.md'
+check "minor: default test pattern matches Tests/ directories and *Test.php files" '
+  is_test_file app/Tests/Unit/Foo.php && is_test_file src/FooTest.php && ! is_test_file src/Testing.php'
+
 unset -f need_image offline
 reload_hutch
 
