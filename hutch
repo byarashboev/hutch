@@ -1421,7 +1421,8 @@ stop_sandbox_run() {
 
 # run_interrupted stops the running sandbox (RUN_JOB, RUN_TAIL, SANDBOX_CONTAINER) when hutch run gets INT or TERM.
 run_interrupted() {
-  trap - INT TERM
+  # Ignored, not reset: a second signal (batch's TERM after Ctrl-C, or a second Ctrl-C) must not end the cleanup.
+  trap '' INT TERM
   stop_sandbox_run "${SANDBOX_CONTAINER:-}" "${RUN_JOB:-}" "${RUN_TAIL:-}"
   echo "hutch: the run was interrupted and its sandbox stopped" >&2
   exit "$1"
@@ -1665,7 +1666,8 @@ cmd_batch() {
   for (( i = 0; i < n; i++ )); do
     if [[ $max_parallel -gt 0 ]]; then
       while [[ -z "$stop" && ${#pids[@]} -ge $max_parallel ]]; do
-        sleep 0.1
+        # Ctrl-C also kills this sleep; batch must still stop its runs and print the summary.
+        sleep 0.1 || true
         next_pids=(); next_idx=()
         for (( k = 0; k < ${#pids[@]}; k++ )); do
           if kill -0 "${pids[$k]}" 2>/dev/null; then
