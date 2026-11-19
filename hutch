@@ -271,6 +271,14 @@ jest.config.*
 */jest.config.*
 conftest.py
 */conftest.py
+tox.ini
+*/tox.ini
+vitest.config.*
+*/vitest.config.*
+phpunit.xml*
+*/phpunit.xml*
+.pre-commit-config.yaml
+*/.pre-commit-config.yaml
 Makefile
 */Makefile
 makefile

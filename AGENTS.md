@@ -170,7 +170,8 @@ Ask these questions together, each with your drafted answer and the reason for i
 10. `hutch export <task>`, then `hutch verify [options] <task>`:
     - **Tier 1 — Hard Denylist (always rejected):** `.hutch/*`, `.git/*`, CI configs, manifests/lockfiles at any depth (`package.json`,
       `go.mod`, `composer.json`, `Gemfile`, `pyproject.toml`, `setup.py`, `pom.xml`, `build.gradle*`, etc.), package-manager,
-      git-hook and test-runner configs (`.npmrc`, `.yarnrc*`, `.husky/*`, `pytest.ini`, `jest.config.*`, `conftest.py`),
+      git-hook and test-runner configs (`.npmrc`, `.yarnrc*`, `.husky/*`, `.pre-commit-config.yaml`, `pytest.ini`, `tox.ini`,
+      `jest.config.*`, `vitest.config.*`, `phpunit.xml*`, `conftest.py`),
       build scripts (`Makefile`/`makefile`, `Dockerfile`, compose files), `.env*`, `.gitattributes`,
       project `protected` patterns (unless `openable` and opened), and **pre-existing test files** (unless `--allow-tests`; `Tests/` directories and `*Test.php` count as tests).
       Renames count as a delete plus an add.

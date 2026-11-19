@@ -1249,6 +1249,14 @@ check "N8: offline removes the overlays it made when a later one fails" '
 unset -f docker
 : >"$CONF/config"
 
+# R1: more test-runner and hook configs are in the hard denylist, at any depth.
+r_missing=""
+for p in tox.ini sub/tox.ini vitest.config.ts sub/vitest.config.mjs phpunit.xml sub/phpunit.xml phpunit.xml.dist \
+  sub/phpunit.xml.dist .pre-commit-config.yaml sub/.pre-commit-config.yaml; do
+  protected "$p" || r_missing+="$p "
+done
+check "R1: hard denylist covers tox, vitest, phpunit and pre-commit configs (missing: $r_missing)" '[[ -z "$r_missing" ]]'
+
 reload_hutch
 CONF="${r_saved[0]}" STATE="${r_saved[1]}" NAME="${r_saved[2]}" REPO="${r_saved[3]}" PROJECT_IMAGE="${r_saved[4]}"
 
