@@ -412,15 +412,12 @@ test_changes() {
   return 0
 }
 
-# pro_models prints the models of the strong kinds, with a space before and after each.
-pro_models() {
+# strong_model succeeds when MODEL is a model of a strong kind in the current model table.
+strong_model() {
   local k pro=" "
   for k in $PRO_KINDS; do pro+="$(awk -F'\t' -v k="$k" '$1 == k { print $2 }' "$MODELS_FILE") "; done
-  echo "$pro"
+  [[ "$pro" == *" $MODEL "* ]]
 }
-
-# strong_model succeeds when MODEL is a model of a strong kind in the current model table.
-strong_model() { [[ "$(pro_models)" == *" $MODEL "* ]]; }
 
 # record_run appends MODEL to task $1's run-models with whether it counts as strong now, when it runs: verify may see
 # another provider's table, or an edited one. The task directory is one the sandbox cannot write (it writes out/).
