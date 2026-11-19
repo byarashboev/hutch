@@ -835,11 +835,15 @@ reload_hutch
 check "minor: HUTCH_NEEDS_SCOPE: in claude assistant text stops the run" '[[ $rc -eq 42 && "$(cat "$GA_OUT/needs-scope.txt")" == src/c.ts ]]'
 
 # M2: a stopped run removes its gates by name, in case its job was killed while gate_up ran.
-docker() { printf '%s\n' "$*" >>"$tmp/ga_stop"; [[ "$1" == ps ]] && echo g-leaked; return 0; }
+docker() {
+  printf '%s\n' "$*" >>"$tmp/ga_stop"
+  [[ "$1" == ps ]] && echo g-leaked; [[ "$1 $2" == "network ls" ]] && echo n-leaked; return 0
+}
 : >"$tmp/ga_stop"
 stop_sandbox_run hutch-run-proj-ga-123-abcd "" ""
-check "M2: stop_sandbox_run removes the run's gates by name" '
-  grep -qxF "ps -aq --filter name=hutch-gate-proj-ga-123-" "$tmp/ga_stop" && grep -qxF "rm -f g-leaked" "$tmp/ga_stop"'
+check "M2: stop_sandbox_run removes the run's gates and networks by name" '
+  grep -qxF "ps -aq --filter name=hutch-gate-proj-ga-123-" "$tmp/ga_stop" && grep -qxF "rm -f g-leaked" "$tmp/ga_stop" &&
+  grep -qxF "network ls -q --filter name=hutch-net-proj-ga-123-" "$tmp/ga_stop" && grep -qxF "network rm n-leaked" "$tmp/ga_stop"'
 unset -f docker
 reload_hutch
 
@@ -889,6 +893,7 @@ check "minor: batch on TERM stops every run, kills their sandboxes and prints th
 unset HUTCH_WATCHDOG_POLL
 
 # --- PR2 fixes: group B (verify) ---
+b_saved=("$CONF" "$STATE" "$NAME" "$REPO" "$PROJECT_IMAGE")
 BREPO="$tmp/brepo"; git init -q -b main "$BREPO"
 mkdir -p "$BREPO/src" "$BREPO/tests" "$BREPO/.github/workflows" "$BREPO/billing"
 printf 'a = 1\n' >"$BREPO/src/a.py"
@@ -970,6 +975,7 @@ check "minor: default test pattern matches Tests/ directories and *Test.php file
 
 unset -f need_image offline
 reload_hutch
+CONF="${b_saved[0]}" STATE="${b_saved[1]}" NAME="${b_saved[2]}" REPO="${b_saved[3]}" PROJECT_IMAGE="${b_saved[4]}"
 
 # --- PR2 fixes: group C (gate, key, networks) ---
 # docker stub: logs every call; with GC_GATE_FAIL the gate has no address, so gate_up stops after creating the network.
