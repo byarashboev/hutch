@@ -37,7 +37,7 @@ Once per computer. Ask the user before each step that installs or stores somethi
      as the service name for DeepSeek).
    - Linux: `secret-tool store --label='hutch opencode-go' service opencode-go`.
    - Elsewhere: export `HUTCH_API_KEY` in the shell that runs hutch.
-5. **Images**: `hutch build` builds `hutch-base`, pulls the pinned gate image and creates the two Docker networks
+5. **Images**: `hutch build` builds `hutch-base`, pulls the pinned gate image and creates the egress Docker network (each run gets its own internal network)
    (plus the project image when run inside a project that is set up).
 6. Run `hutch status` again; every machine line must say ok.
 7. **gVisor (optional, Linux).** For a stronger boundary than a container, offer gVisor: install `runsc`
@@ -46,8 +46,8 @@ Once per computer. Ask the user before each step that installs or stores somethi
    reports the sandbox's kernel, which under gVisor differs from the host's. Docker Desktop on macOS does not ship it.
 
 The sandbox has no route out; its only peer is a gate started for each sandbox command. The gate holds the real key in
-its own environment, validates a unique per-run `HUTCH_PROXY_TOKEN` sent by the sandbox, strips any alternative
-credential headers, blocks path traversal or credential query parameters, and forwards only the provider's `paths=` to
+its own environment, validates a unique per-run `HUTCH_PROXY_TOKEN` sent by the sandbox (exact match, case-sensitive), strips any alternative
+credential headers, refuses anything but plain paths (`[A-Za-z0-9._~/-]`, no dot segments, no query string except `?beta=true`), and forwards only the provider's `paths=` to
 its `upstream` while overwriting `Authorization` / `x-api-key` in flight. The sandbox never holds the real key and cannot
 authenticate to another account on the upstream provider. Do not widen a provider's paths or point it at another host
 to make a task easier: package registries and Git hosts stay closed on purpose.
@@ -92,8 +92,9 @@ Ask these questions together, each with your drafted answer and the reason for i
 2. Fill in every file:
    - `config`: `base_branch`, `manifests` (an ERE over repository paths), `cache_overlays` (read-only host
      dependency/cache directories mounted with ephemeral CoW upper layers, e.g. `node_modules:/work/node_modules`) and
-     `cache_overlay_mode` (`auto`, `docker-overlay`, `cow-tmpfs`, `ro`), `cache_mount` (optional Docker cache volume,
-     mounted as a read-only base with an ephemeral CoW overlay), `scope_mode` (`soft` or `strict`), `max_turns` and
+     `cache_overlay_mode` (`auto`, `docker-overlay`, `cow-tmpfs`, `ro`; `cow-tmpfs` copies the cache into RAM at every
+     start, counted against `memory=`, so exceeding it kills the container with exit 137; `auto` probes the overlay volume
+     and falls back to `cow-tmpfs`), `scope_mode` (`strict`, the default, or `soft`), `max_turns` and
      `loop_threshold` watchdog defaults, and `runtime` if gVisor is installed.
    - `Dockerfile`: the toolchain, pinned; warm the caches from `src/` (the manifests); end offline and as `USER hutch`.
    - `verify.sh`: the checks per changed area. Every command must work with no network. It must fail on a failing
@@ -145,29 +146,40 @@ Ask these questions together, each with your drafted answer and the reason for i
    `HUTCH_KIND=<kind> hutch run [--max-turns <N>] [--max-timeout <S>] [--loop-threshold <N>] [--context <spec>...] <task>`
    (`hutch models` shows the table). Tasks that touch `pro-paths` or open protected paths are refused unless the kind is
    a strong one (`design` or `concurrency`). A mixed task can run `HUTCH_PHASE=design` on a strong model first (it writes
-   `/out/design-notes.md`), then `HUTCH_PHASE=build` with a cheaper kind; add a "Reviewer notes" section to the design
+   `/out/design-notes.md`, i.e. `out/<task>/sandbox/design-notes.md` on the host), then `HUTCH_PHASE=build` with a cheaper kind; add a "Reviewer notes" section to the design
    notes to correct them before the build.
 7. **Parallel fan-out**: run independent tasks concurrently with
    `hutch batch [--max-parallel <N>] [--max-turns <N>] [--max-timeout <S>] [--loop-threshold <N>] <task1> <task2> ...`
    (or concurrent `hutch run` invocations). Every run gets unique gate names, proxy tokens, CoW overlays, and per-task
-   agent state directories (`oc-data` / `claude-data`).
+   agent state directories (`oc-data` / `claude-data`), and its own internal network shared only by its sandbox and gate.
+   Docker's default address pools allow roughly 30 bridge networks, so a very large fan-out can hit that limit. On Ctrl-C or
+   TERM, `batch` stops all runs and still prints its summary (outcomes `interrupted` and `not started`; exit 130/143);
+   it rejects a task named twice.
 8. After the run, check the exit code and `run.err` (in `~/.hutch/state/<name>/out/<task>/`):
-   - `0`: completed normally; read `self-review.md` and the end of `run.jsonl`.
-   - `42` (`EARLY_ABORT: NEEDS_SCOPE`): the sandbox wrote `.hutch-needs-scope` or `HUTCH_NEEDS_SCOPE:`; read
-     `needs-scope.txt`, widen `--allow` (or handle directly), and resume or re-run.
-   - `43` (`EARLY_ABORT: LOOP_DETECTED`): watchdog stopped 3 consecutive identical failing commands or errors; read `abort.log`.
+   - `0`: completed normally; read `sandbox/self-review.md` (the sandbox's `/out`) and the end of `run.jsonl`. Ctrl-C on `hutch run` stops the sandbox
+     and gate (exit 130/143).
+   - `42` (`EARLY_ABORT: NEEDS_SCOPE`): the sandbox wrote `.hutch-needs-scope` or printed `HUTCH_NEEDS_SCOPE:` in its own
+     text (tool output does not count); read `needs-scope.txt`, add the paths to the task's allow file
+     (`~/.hutch/state/<name>/work/<task>/allow`, or handle directly), and re-run (`hutch run` has no `--allow`; stale markers
+     are removed at the start of each run).
+   - `43` (`EARLY_ABORT: LOOP_DETECTED`): watchdog stopped the same command failing with the same error `--loop-threshold` times in a row (empty or generic errors don't count); read `abort.log`.
    - `44` (`EARLY_ABORT: MAX_TURNS`): watchdog stopped the run when turns exceeded `--max-turns`; inspect `abort.log`.
-   - `124`: hit `run_timeout` / `--max-timeout`.
+   - `124`: hit `run_timeout` / `--max-timeout` (`0` means no limit).
 9. Follow-ups: `hutch say <task> "<message>"` (opencode: after the run ends; Claude Code: during it).
 10. `hutch export <task>`, then `hutch verify [options] <task>`:
-    - **Tier 1 — Hard Denylist (always rejected):** `.hutch/*`, `.git/*`, CI configs, manifests/lockfiles (`package.json`,
-      `go.mod`, `Cargo.toml`, `pyproject.toml`, etc.), build scripts (`Makefile`, `Dockerfile`), `.env*`, `.gitattributes`,
-      project `protected` patterns (unless `openable` and opened), and **pre-existing test files** (unless `--allow-tests`).
+    - **Tier 1 — Hard Denylist (always rejected):** `.hutch/*`, `.git/*`, CI configs, manifests/lockfiles at any depth (`package.json`,
+      `go.mod`, `composer.json`, `Gemfile`, `pyproject.toml`, `setup.py`, `pom.xml`, `build.gradle*`, etc.), package-manager,
+      git-hook and test-runner configs (`.npmrc`, `.yarnrc*`, `.husky/*`, `pytest.ini`, `jest.config.*`, `conftest.py`),
+      build scripts (`Makefile`/`makefile`, `Dockerfile`, compose files), `.env*`, `.gitattributes`,
+      project `protected` patterns (unless `openable` and opened), and **pre-existing test files** (unless `--allow-tests`; `Tests/` directories and `*Test.php` count as tests).
+      Renames count as a delete plus an add.
       New test files added by the agent are permitted without `--allow-tests`.
     - **Tier 2 — Explicit Allowlist (`--allow`):** `ok`.
-    - **Tier 3 — Soft Scope (default, or `--soft-scope`):** non-protected source edits outside `--allow` pass verification
-      with a **`WARN: UNSCOPED_PATHS`** section and diff stat (and are saved to `unscoped.txt`) for senior review. Pass
-      `--strict-scope` (or `scope_mode=strict`) to fail on any unscoped edit, or `--allow <glob>` to promote a path.
+    - **Tier 3 — Strict Scope (default, or `--strict-scope`):** any edit outside `--allow` fails verification; pass
+      `--allow <glob>` to promote a path. With `--soft-scope` (or `scope_mode=soft`), non-protected source edits outside
+      `--allow` pass with a **`WARN: UNSCOPED_PATHS`** section and diff stat (saved to `unscoped.txt`) for senior review.
+    - Files matching `pro-paths` fail verification unless every run of the task used a strong kind (`design`/`concurrency`;
+      recorded in `work/<task>/run-models`; a task with no record fails closed).
     - Lists added comment lines, names changes to existing tests, and runs `verify.sh` offline with read-only base overlays.
 11. `hutch report <task>` gives the model, usage, commits, verify status, test changes, `WARN: UNSCOPED_PATHS`, and
     requested scope escalations in one page (`report.md`); start the review from it.

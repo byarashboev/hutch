@@ -18,7 +18,7 @@ verifies.
   `~/.hutch/providers/<name>.conf` (Claude Code agent). The model is chosen by the kind of work (`HUTCH_KIND`).
 - **Isolation:** the container has no capabilities, sees only its own clone of the repository, and has no route out.
   Its only peer is a per-run zero-knowledge gate that authenticates a per-run `HUTCH_PROXY_TOKEN`, strips alternative
-  auth headers and path traversals, injects the real host key in-flight only for allowed API paths, and logs every call.
+  auth headers, forwards only plain paths (no dot segments, no query string except `?beta=true`), injects the real host key in-flight only for allowed API paths, and logs every call.
   Dependency/build caches (`cache_overlays`) mount read-only under ephemeral per-run copy-on-write layers so the sandbox
   runs warm offline without risking host cache poisoning. Results come back as a git bundle.
 - **Any project:** each project describes its toolchain, checks and protected paths in a small config directory.
@@ -101,7 +101,7 @@ By hand: `hutch init` (or `hutch init --in-repo`) copies [template/](template/) 
 
 | File | Purpose |
 |---|---|
-| `config` | `base_branch`, `manifests`, `cache_overlays`, `cache_overlay_mode`, `cache_mount`, `scope_mode`, `max_turns`, `loop_threshold`, limits |
+| `config` | `base_branch`, `manifests`, `cache_overlays`, `cache_overlay_mode`, `scope_mode`, `max_turns`, `loop_threshold`, limits |
 | `Dockerfile` | `FROM hutch-base` plus the project's toolchain, caches warmed for offline use |
 | `verify.sh` | the checks `hutch verify` runs offline, per changed area |
 | `protected` | paths the agent may never change |
@@ -125,7 +125,7 @@ computer, for shared repositories). hutch looks in that order.
 | `hutch batch [options] <task1> <task2>...` | run tasks concurrently (`--max-parallel`, `--max-turns`, `--max-timeout`, `--loop-threshold`) |
 | `hutch say <task> <message>` | follow-up message |
 | `hutch shell <task>` | interactive agent session in the sandbox |
-| `hutch export <task>` / `hutch verify [options] <task>` | bundle the result / two-tier check (`--soft-scope`, `--strict-scope`, `--allow-tests`, `--allow`) offline |
+| `hutch export <task>` / `hutch verify [options] <task>` | bundle the result / two-tier check (`--soft-scope`, `--strict-scope`, `--allow-tests`, `--allow`; strict scope is the default) offline |
 | `hutch report <task>` | model, tokens, time, commits, verify status, test changes, unscoped/scope warnings (`report.md`) |
 | `hutch ls` | the project's tasks: age, running or exit code, verify status, commits, model |
 | `hutch rm <task>` | remove the task |

@@ -49,9 +49,9 @@ themselves.
    ```sh
    HUTCH_KIND=script hutch run --max-turns 12 --max-timeout 600 --loop-threshold 3 <task>
    ```
-   - Exit `0`: finished cleanly. Inspect `self-review.md` and `run.jsonl`.
-   - Exit `42` (`EARLY_ABORT: NEEDS_SCOPE`): the sandbox stopped early requesting extra paths in `needs-scope.txt`. Decide whether to expand scope (`--allow`), handle directly, or reject.
-   - Exit `43` (`EARLY_ABORT: LOOP_DETECTED`): repeated identical failing command/error 3 times consecutively. Read `abort.log` in `~/.hutch/state/<project>/out/<task>/`.
+   - Exit `0`: finished cleanly. Inspect `sandbox/self-review.md` and `run.jsonl`. Ctrl-C stops the sandbox and gate (exit 130/143).
+   - Exit `42` (`EARLY_ABORT: NEEDS_SCOPE`): the sandbox stopped early requesting extra paths in `needs-scope.txt`. Decide whether to expand scope (add the paths to the task's allow file, `~/.hutch/state/<project>/work/<task>/allow`, then re-run), handle directly, or reject.
+   - Exit `43` (`EARLY_ABORT: LOOP_DETECTED`): the same command failed with the same error `--loop-threshold` times in a row. Read `abort.log` in `~/.hutch/state/<project>/out/<task>/`.
    - Exit `44` (`EARLY_ABORT: MAX_TURNS`) or `124` (timeout): inspect `abort.log` / `run.jsonl` and partial commits.
 5. Follow-ups: `hutch say <task> "<message>"`.
 6. Export and verify offline with **two-tier path scoping**:
@@ -59,9 +59,10 @@ themselves.
    hutch export <task>
    hutch verify <task>
    ```
-   - **Hard Denylist (always fails):** `.hutch/*`, `.git/*`, CI configs, manifests/lockfiles (`package.json`, `go.mod`, `Cargo.toml`, `pyproject.toml`, etc.), build scripts (`Makefile`, `Dockerfile`), `.env*`, `.gitattributes`, and **pre-existing test files** (pass `--allow-tests` only when test edits are intended). New test files are allowed without `--allow-tests`.
+   - **Hard Denylist (always fails):** `.hutch/*`, `.git/*`, CI configs, manifests/lockfiles (`package.json`, `go.mod`, `Cargo.toml`, `pyproject.toml`, etc.), build scripts (`Makefile`, `Dockerfile`), package-manager/git-hook/test-runner configs (`.npmrc`, `.husky/*`, `conftest.py`, etc.; manifests count at any depth), `.env*`, `.gitattributes`, and **pre-existing test files** (pass `--allow-tests` only when test edits are intended). New test files are allowed without `--allow-tests`.
    - **Explicit Allowlist (`--allow`):** passes cleanly (`ok`).
-   - **Soft Scope (default):** non-protected source edits outside `--allow` still pass verification with a structured **`WARN: UNSCOPED_PATHS`** section + diff stat so you can review and approve/reject them. Use `--strict-scope` to reject unscoped edits, or `--allow <glob>` on `verify` to promote them.
+   - **Strict Scope (default):** edits outside `--allow` fail verification; use `--allow <glob>` on `verify` to promote them. With `--soft-scope` (or `scope_mode=soft`) they pass with a structured **`WARN: UNSCOPED_PATHS`** section + diff stat for you to approve/reject.
+   - **`pro-paths`:** changed files matching them fail unless every run of the task used a strong kind (`design`/`concurrency`).
 7. `hutch report <task>`: one-page summary including `WARN: UNSCOPED_PATHS` and `Requested Scope Escalation` if present.
 8. **Review the diff yourself:** `git -C <repo> diff <base> refs/hutch/<task>`. Passing `verify` is not acceptance.
 9. Take the work from `refs/hutch/<task>` (branch or cherry-pick) and continue with your normal process.
@@ -69,11 +70,13 @@ themselves.
 
 ## 3. Parallel Fan-Out (`hutch batch`)
 
-Every `hutch` sandbox isolates its gate container, per-run proxy token, internal IP, CoW cache overlay, agent state dir (`oc-data` / `claude-data`), and export bundle — so multiple tasks can safely run concurrently:
+Every `hutch` sandbox isolates its gate container, per-run proxy token, internal network, CoW cache overlay, agent state dir (`oc-data` / `claude-data`), and export bundle — so multiple tasks can safely run concurrently:
 
 ```sh
 hutch batch --max-parallel 4 --max-turns 12 --max-timeout 600 mod-a mod-b mod-c mod-d
 ```
+
+Docker's default address pools allow roughly 30 bridge networks (one per run), so very large fan-outs may hit that. Ctrl-C stops all runs and still prints the summary (`interrupted` / `not started`; exit 130/143); a task named twice is rejected.
 
 Or run `hutch run t1 & hutch run t2 & wait`, followed by concurrent `hutch export` / `hutch verify`.
 
