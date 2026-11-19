@@ -23,10 +23,10 @@ runtime=
 # focus markers. tests_policy=report only names them; append-only also fails verify.
 tests=
 tests_policy=report
-# Path scoping mode for hutch verify: soft (default: warn with WARN: UNSCOPED_PATHS on non-protected files outside
-# allow) or strict (fail on any file outside allow). Hard-protected files and pre-existing tests always fail unless
-# --allow-tests is passed.
-scope_mode=soft
+# Path scoping mode for hutch verify: strict (default: fail on any file outside allow) or soft (warn with
+# WARN: UNSCOPED_PATHS on non-protected files outside allow). Hard-protected files always fail, pre-existing tests fail
+# unless --allow-tests is passed, and files matching pro-paths fail unless every run of the task used a strong kind.
+scope_mode=strict
 # Wall-clock limits in seconds: a run (and each hutch say follow-up), and the checks of hutch verify.
 run_timeout=3600
 verify_timeout=1800

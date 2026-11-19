@@ -300,7 +300,7 @@ scope_mode() {
     elif [[ "${HUTCH_SOFT_SCOPE:-}" == 1 ]]; then m=soft
     else m="$(conf_get scope_mode)"; fi
   fi
-  m="${m:-soft}"
+  m="${m:-strict}"
   [[ "$m" == soft || "$m" == strict ]] || die "scope_mode must be soft or strict, got '$m'"
   echo "$m"
 }
@@ -369,12 +369,35 @@ test_changes() {
   return 0
 }
 
+# pro_models prints the models of the strong kinds, with a space before and after each.
+pro_models() {
+  local k pro=" "
+  for k in $PRO_KINDS; do pro+="$(awk -F'\t' -v k="$k" '$1 == k { print $2 }' "$MODELS_FILE") "; done
+  echo "$pro"
+}
+
+# ran_strong succeeds when task $1 has run and every run used a strong model. cmd_run and cmd_say record each run's
+# model in the task directory, which the sandbox cannot write (it can write the out directory).
+ran_strong() {
+  local rec pro m
+  rec="$(task_dir "$1")/run-models"
+  [[ -s "$rec" ]] || return 1
+  pro="$(pro_models)"
+  while IFS= read -r m; do [[ -n "$m" && "$pro" == *" $m "* ]] || return 1; done <"$rec"
+}
+
+# pro_path succeeds when repository path $1 matches a pro-paths line.
+pro_path() {
+  local g
+  while IFS= read -r g; do [[ "$1" == $g ]] && return 0; done < <(patterns "$CONF/pro-paths")
+  return 1
+}
+
 need_pro_kind() {
-  local dir reason k pro=" "
+  local dir reason
   dir="$(task_dir "$1")"
   reason="$(needs_pro "$dir/allow" "$dir/opened")" || return 0
-  for k in $PRO_KINDS; do pro+="$(awk -F'\t' -v k="$k" '$1 == k { print $2 }' "$MODELS_FILE") "; done
-  [[ "$pro" == *" $MODEL "* ]] && return 0
+  [[ "$(pro_models)" == *" $MODEL "* ]] && return 0
   die "task $1 $reason; run it with HUTCH_KIND set to one of: $PRO_KINDS (a strong model)"
 }
 
@@ -1437,6 +1460,7 @@ cmd_run() {
   [[ -s "$out/run.jsonl" ]] && /bin/mv -f "$out/run.jsonl" "$out/run.$(date +%Y%m%d%H%M%S).jsonl"
   : >"$out/run.jsonl"
   echo "$(date -u +%FT%TZ) agent=$AGENT provider=$PROVIDER kind=$KIND model=$MODEL small=$SMALL_MODEL phase=${HUTCH_PHASE:-}" >>"$out/models.log"
+  echo "$MODEL" >>"$dir/run-models"
 
   RUN_ID="$(rand_hex 4)"
   SANDBOX_CONTAINER="hutch-run-${NAME}-${task}-$$-${RUN_ID}"
@@ -1647,6 +1671,7 @@ cmd_say() {
   if [[ "$AGENT" == opencode ]]; then
     [[ -f "$out/exit.code" ]] || die "$1 has no finished run; opencode takes a follow-up only after the run stops"
     /bin/rm -f "$out/exit.code"
+    echo "$MODEL" >>"$(task_dir "$1")/run-models"
     SANDBOX_CMD=(timeout -k 30 "$(run_timeout)" opencode run --standalone --auto --format json --continue "$2")
     local rc=0
     sandbox "$1" >>"$out/run.jsonl" 2>>"$out/run.err" || rc=$?
@@ -1704,6 +1729,8 @@ cmd_verify() {
   bundle="$out/$task.bundle"
   mode="$(scope_mode "$mode_arg")"
   [[ "${HUTCH_ALLOW_TESTS:-}" == 1 ]] && allow_tests=1
+  local strong=0
+  ran_strong "$task" && strong=1
   ALLOW_FILE="${allow_override:-$dir/allow}"; OPENED_FILE="$dir/opened"
   EXTRA_ALLOW=""
   if [[ ${#extra_globs[@]} -gt 0 ]]; then
@@ -1732,6 +1759,9 @@ cmd_verify() {
     elif allowed "$f"; then echo "ok $f"
     elif [[ "$mode" == soft ]]; then echo "UNSCOPED $f"; unscoped+=("$f")
     else echo "NOT-ALLOWED $f"; bad=1; fi
+    if [[ $strong -eq 0 ]] && pro_path "$f"; then
+      echo "PRO-PATH $f (matches pro-paths; not every run of this task used a strong kind: $PRO_KINDS)"; bad=1
+    fi
   done
   if [[ ${#unscoped[@]} -gt 0 ]]; then
     echo "== WARN: UNSCOPED_PATHS"

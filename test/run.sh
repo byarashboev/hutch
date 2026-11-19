@@ -227,8 +227,8 @@ check "is_preexisting_test detects existing test files at base but allows new te
   ! is_preexisting_test "$trbase" src/app.js
 '
 
-check "scope_mode defaults to soft and honors config, env, and explicit arg" '
-  [[ "$(scope_mode)" == soft ]] &&
+check "scope_mode defaults to strict and honors config, env, and explicit arg" '
+  [[ "$(scope_mode)" == strict ]] &&
   (printf "scope_mode=strict\n" >"$CONF/config"; [[ "$(scope_mode)" == strict ]]) &&
   (printf "scope_mode=soft\n" >"$CONF/config"; HUTCH_STRICT_SCOPE=1; [[ "$(scope_mode)" == strict ]]) &&
   (printf "scope_mode=strict\n" >"$CONF/config"; HUTCH_SOFT_SCOPE=1; [[ "$(scope_mode)" == soft ]]) &&
@@ -247,7 +247,7 @@ git -C "$VREPO" add -A; git -C "$VREPO" -c user.name=t -c user.email=t@t commit 
 vbase="$(git -C "$VREPO" rev-parse HEAD)"
 
 CONF="$tmp/vconf"; mkdir -p "$CONF"
-: >"$CONF/config"; : >"$CONF/protected"; : >"$CONF/openable"
+printf 'scope_mode=soft\n' >"$CONF/config"; : >"$CONF/protected"; : >"$CONF/openable"
 printf 'true\n' >"$CONF/verify.sh"
 STATE="$tmp/vstate"; NAME=vproj; REPO="$VREPO"; PROJECT_IMAGE="hutch-vproj:latest"
 printf 'src/a.js\n' >"$tmp/vallow"
@@ -930,6 +930,28 @@ check "B4: verify rejects moving protected files into an allowed directory" '
 make_btask bedittest 'printf "def test_b():\n" >tests/tëst_b.py'
 out="$( (cmd_verify --allow-tests bedittest) 2>&1)"; rc=$?
 check "B4: test changes name an edited test with a non-ASCII name" '[[ "$out" == *"EDITED tests/tëst_b.py (-1)"* ]]'
+
+check "M1: scope_mode defaults to strict without a scope_mode line, and the template sets strict" '
+  (: >"$CONF/config"; [[ "$(scope_mode)" == strict ]]) && [[ "$(kv_get "$here/template/config" scope_mode)" == strict ]]'
+
+printf 'scope_mode=soft\n' >"$CONF/config"; printf 'billing/*\n' >"$CONF/pro-paths"
+make_btask bpro 'printf "fee = 2\n" >billing/fees.py'
+out="$( (cmd_verify bpro) 2>&1)"; rc=$?
+check "M1: verify fails a pro-paths change when no run of the task is recorded" '[[ $rc -ne 0 && "$out" == *"PRO-PATH billing/fees.py"* ]]'
+echo deepseek-v4.1-flash >"$STATE/work/bpro/run-models"
+echo "x agent=opencode provider=opencode kind=design model=deepseek-v4-pro small=s phase=" >"$STATE/out/bpro/models.log"
+out="$( (cmd_verify bpro) 2>&1)"; rc=$?
+check "M1: verify fails a pro-paths change after a cheap run, even in soft scope and with a forged out/models.log" '
+  [[ $rc -ne 0 && "$out" == *"PRO-PATH billing/fees.py"* ]]'
+printf 'deepseek-v4-pro\nkimi-k3\n' >"$STATE/work/bpro/run-models"
+out="$( (cmd_verify --allow 'billing/*' bpro) 2>&1)"; rc=$?
+check "M1: verify passes a pro-paths change when every run used a strong model" '[[ $rc -eq 0 && "$out" == *"ok billing/fees.py"* ]]'
+
+cmd_new brec "$tmp/ballow" "$tmp/vbrief" >/dev/null
+sandbox() { return 0; }
+(MODEL=glm-5.2 SMALL_MODEL=s AGENT=opencode; cmd_run brec; cmd_say brec more) >/dev/null 2>&1
+check "M1: run and opencode follow-ups record their model in the task directory" '
+  [[ "$(tr "\n" " " <"$STATE/work/brec/run-models")" == "glm-5.2 glm-5.2 " ]]'
 
 unset -f need_image offline
 reload_hutch
