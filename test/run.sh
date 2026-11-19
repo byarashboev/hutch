@@ -601,14 +601,14 @@ check "watchdog aborts mid-flight on 3 consecutive identical failing opencode co
      "$(cat "$STATE/out/ctx1/exit.code")" == 43 && -s "$STATE/out/ctx1/abort.log" ]]
 '
 
-# Mid-Flight Watchdog: claude tool_result identical error detection (different commands, same error).
+# Mid-Flight Watchdog: claude tool_result loop detection (the same command with the same error).
 sandbox() {
   printf '%s\n' \
     '{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cmd1"}}]}}' \
     '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"EACCES permission denied"}]}}' \
-    '{"type":"assistant","message":{"id":"m2","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"cmd2"}}]}}' \
+    '{"type":"assistant","message":{"id":"m2","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"cmd1"}}]}}' \
     '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"EACCES permission denied"}]}}' \
-    '{"type":"assistant","message":{"id":"m3","content":[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"cmd3"}}]}}' \
+    '{"type":"assistant","message":{"id":"m3","content":[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"cmd1"}}]}}' \
     '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3","is_error":true,"content":"EACCES permission denied"}]}}'
   sleep 15
 }
@@ -773,6 +773,65 @@ check "B1: export never mounts the output directory and leaves the bundle there"
 
 unset -f docker need_image
 reload_hutch
+
+# B1: a symlinked .hutch-needs-scope (in /work or /out) is never read on the host.
+echo "secret-host-line" >"$tmp/ga_hostfile"
+sandbox() {
+  ln -s "$tmp/ga_hostfile" "$GA_REPO/.hutch-needs-scope"
+  ln -s "$tmp/ga_hostfile" "$GA_OUT/sandbox/.hutch-needs-scope"
+  return 0
+}
+out="$( (cmd_run ga) 2>&1)"; rc=$?
+reload_hutch
+check "B1: the watchdog ignores a symlinked .hutch-needs-scope" '
+  [[ $rc -eq 0 && "$out" != *"secret-host-line"* && "$out" != *NEEDS_SCOPE* && ! -e "$GA_OUT/needs-scope.txt" ]]'
+
+# M4: malformed or unexpectedly typed events are skipped; later events still count.
+sandbox() {
+  printf '%s\n' 'not json' '[1, 2]' '"str"' \
+    '{"type":"error","error":{"message":{"x":1}}}' \
+    '{"type":"assistant","message":{"id":{"x":1},"content":[{"type":"tool_use","id":["t"],"input":{}}]}}' \
+    '{"type":"tool_use","part":{"tool":"bash","state":{"status":"error","input":{"command":{"x":1}},"error":{"a":1}}}}' \
+    '{"type":"result","is_error":true,"result":{"x":1},"num_turns":"9"}' \
+    '{"type":"step_start"}' '{"type":"step_start"}' '{"type":"step_start"}'
+  sleep 15
+}
+out="$( (set -e; cmd_run --max-turns 2 ga) 2>&1)"; rc=$?
+reload_hutch
+check "M4: the watchdog survives malformed events and still enforces max-turns" '[[ $rc -eq 44 && "$out" == *"EARLY_ABORT: MAX_TURNS"* ]]'
+
+# M3: only the same command with the same error is a loop; generic errors and different commands are not.
+ga_oc() { printf '{"type":"tool_use","part":{"tool":"bash","state":{"status":"completed","input":{"command":"%s"},"metadata":{"exit":1},"output":"%s"}}}\n' "$1" "$2"; }
+sandbox() { ga_oc "grep a f" ""; ga_oc "grep b f" ""; ga_oc "test -f x" ""; return 0; }
+out="$( (cmd_run ga) 2>&1)"; rc=$?
+check "M3: three different commands failing with no output are not a loop" '[[ $rc -eq 0 && "$out" != *LOOP_DETECTED* ]]'
+sandbox() { ga_oc "npm test" "fail one"; ga_oc "npm test" "fail two"; ga_oc "npm test" "fail three"; return 0; }
+out="$( (cmd_run ga) 2>&1)"; rc=$?
+check "M3: the same command with different errors is not a loop" '[[ $rc -eq 0 && "$out" != *LOOP_DETECTED* ]]'
+sandbox() { ga_oc "npm test" ""; ga_oc "npm test" ""; ga_oc "npm test" ""; return 0; }
+out="$( (cmd_run ga) 2>&1)"; rc=$?
+check "M3: the same command with only a generic error is not a loop" '[[ $rc -eq 0 && "$out" != *LOOP_DETECTED* ]]'
+ga_cl() {
+  printf '{"type":"assistant","message":{"id":"m%s","content":[{"type":"tool_use","id":"t%s","name":"Bash","input":{"command":"%s"}}]}}\n' "$1" "$1" "$2"
+  printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t%s","content":"Exit code 1"}]}}\n' "$1"
+}
+sandbox() { ga_cl 1 "grep a f"; ga_cl 2 "grep b f"; ga_cl 3 "test -f x"; return 0; }
+out="$( (cmd_run ga) 2>&1)"; rc=$?
+reload_hutch
+check "M3: claude: different commands with \"Exit code 1\" are not a loop" '[[ $rc -eq 0 && "$out" != *LOOP_DETECTED* ]]'
+
+# Minor: HUTCH_NEEDS_SCOPE: counts only in the agent's own text, not in a tool's output.
+sandbox() {
+  printf '%s\n' '{"type":"tool_use","part":{"tool":"bash","state":{"status":"completed","input":{"command":"cat notes"},"metadata":{"exit":0},"output":"HUTCH_NEEDS_SCOPE: src/a.ts"}}}' \
+    '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"x","content":"HUTCH_NEEDS_SCOPE: src/b.ts"}]}}'
+  return 0
+}
+out="$( (cmd_run ga) 2>&1)"; rc=$?
+check "minor: HUTCH_NEEDS_SCOPE: in tool output does not stop the run" '[[ $rc -eq 0 && "$out" != *NEEDS_SCOPE* ]]'
+sandbox() { printf '%s\n' '{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"Blocked.\nHUTCH_NEEDS_SCOPE: src/c.ts"}]}}'; return 0; }
+out="$( (cmd_run ga) 2>&1)"; rc=$?
+reload_hutch
+check "minor: HUTCH_NEEDS_SCOPE: in claude assistant text stops the run" '[[ $rc -eq 42 && "$(cat "$GA_OUT/needs-scope.txt")" == src/c.ts ]]'
 
 echo "failures: $fails"
 [[ $fails -eq 0 ]]

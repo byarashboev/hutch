@@ -1052,7 +1052,7 @@ last = None
 for line in open(log):
     try:
         last = json.loads(line).get("type")
-    except ValueError:
+    except (ValueError, AttributeError):
         last = None
 quiet = time.time() - os.path.getmtime(log) >= idle
 sys.exit(0 if last == "result" and quiet and os.path.getmtime(steer) <= os.path.getmtime(log) else 1)
@@ -1087,11 +1087,11 @@ EOF
   echo "$base"
 }
 
-# watchdog_inspect inspects run.jsonl, .hutch-needs-scope files, turn count, and consecutive failure loops.
+# watchdog_inspect inspects run.jsonl, the .hutch-needs-scope files, the turn count and repeated failures.
 # Outputs ACTION=... and REASON=... (plus writes payload to $out_dir/watchdog.detail) when an abort should fire.
 watchdog_inspect() {
   python3 -I - "$1" "$2" "$3" "$4" "$5" <<'EOF'
-import json, os, re, sys
+import json, os, re, stat, sys
 
 log_path, work_dir, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
 max_turns, loop_threshold = int(sys.argv[4]), int(sys.argv[5])
@@ -1107,29 +1107,41 @@ def add_path(p):
         seen_paths.add(p)
         scope_paths.append(p)
 
-for candidate in (os.path.join(work_dir, ".hutch-needs-scope"), os.path.join(out_dir, ".hutch-needs-scope")):
-    if os.path.isfile(candidate):
-        with open(candidate, errors="replace") as fh:
-            for raw in fh:
-                line = raw.split("#", 1)[0].strip()
-                if line:
-                    add_path(line)
+def read_regular(path):
+    # The sandbox writes these files: never follow a symlink, never block on a FIFO, read only a regular file.
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return ""
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return ""
+        return os.read(fd, 65536).decode("utf-8", "replace")
+    finally:
+        os.close(fd)
 
-def collect_texts(obj):
-    out = []
-    if isinstance(obj, str):
-        out.append(obj)
-    elif isinstance(obj, list):
-        for item in obj:
-            out.extend(collect_texts(item))
-    elif isinstance(obj, dict):
-        for k in ("text", "result", "content", "output"):
-            if k in obj:
-                out.extend(collect_texts(obj[k]))
-        for k in ("part", "message"):
-            if isinstance(obj.get(k), dict):
-                out.extend(collect_texts(obj[k]))
-    return out
+for candidate in (os.path.join(work_dir, ".hutch-needs-scope"), os.path.join(out_dir, "sandbox", ".hutch-needs-scope")):
+    for raw in read_regular(candidate).splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line:
+            add_path(line)
+
+def assistant_texts(e):
+    # Only the agent's own words count as a scope request, never a tool's output that it quotes.
+    etype = e.get("type")
+    if etype == "text":
+        part = e.get("part")
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            yield part["text"]
+    elif etype == "assistant":
+        msg = e.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list):
+            for blk in content:
+                if isinstance(blk, dict) and blk.get("type") == "text" and isinstance(blk.get("text"), str):
+                    yield blk["text"]
+    elif etype == "result" and isinstance(e.get("result"), str):
+        yield e["result"]
 
 def flatten_text(obj):
     if obj is None:
@@ -1154,6 +1166,11 @@ def norm_err(s):
     s = ansi_re.sub("", s or "")
     return norm_ws(s)[:300]
 
+# An error text that says no more than "error" or "exit code N" cannot tell two failures apart.
+generic_re = re.compile(r"(?i)\b(?:error|exit(?:\s+code|\s+status)?)\b[:\s]*-?\d*")
+def is_generic(s):
+    return not re.sub(r"[\W_]+", "", generic_re.sub("", s or ""))
+
 marker_re = re.compile(r"^\s*HUTCH_NEEDS_SCOPE:\s*(.+)$", re.MULTILINE)
 exit_code_re = re.compile(r"(?:^|\n)Exit code\s+([1-9][0-9]*)\b")
 
@@ -1162,144 +1179,121 @@ finished_turns = 0
 seen_assistant_ids = set()
 pending_tools = {}
 
-cmd_streak = 0
-last_fail_cmd = None
-err_streak = 0
-last_fail_err = None
+streak = 0
+last_sig = None
 last_detail = ""
 
 def record_success():
-    global cmd_streak, last_fail_cmd, err_streak, last_fail_err
-    cmd_streak = 0
-    last_fail_cmd = None
-    err_streak = 0
-    last_fail_err = None
+    global streak, last_sig
+    streak = 0
+    last_sig = None
 
+# A loop is the same command failing with the same error; a failure without a command or with a generic error
+# breaks the streak instead of adding to it.
 def record_failure(cmd_sig, err_sig, detail):
-    global cmd_streak, last_fail_cmd, err_streak, last_fail_err, last_detail
-    if cmd_sig:
-        if cmd_sig == last_fail_cmd:
-            cmd_streak += 1
-        else:
-            last_fail_cmd = cmd_sig
-            cmd_streak = 1
+    global streak, last_sig, last_detail
+    if not cmd_sig or is_generic(err_sig):
+        record_success()
+        return
+    sig = (cmd_sig, err_sig)
+    if sig == last_sig:
+        streak += 1
     else:
-        cmd_streak = 0
-        last_fail_cmd = None
-    if err_sig:
-        if err_sig == last_fail_err:
-            err_streak += 1
-        else:
-            last_fail_err = err_sig
-            err_streak = 1
-    else:
-        err_streak = 0
-        last_fail_err = None
+        last_sig = sig
+        streak = 1
     last_detail = detail.strip()
+
+def inspect(e):
+    global started_turns, finished_turns
+    for txt in assistant_texts(e):
+        for m in marker_re.finditer(txt):
+            for tok in re.split(r"[,\s]+", m.group(1).strip()):
+                if tok:
+                    add_path(tok)
+
+    etype = e.get("type")
+    part = e.get("part") if isinstance(e.get("part"), dict) else {}
+    ptype = part.get("type")
+
+    if etype == "step_start" or ptype == "step-start" or etype in ("turn", "turn_start"):
+        started_turns += 1
+    elif etype == "step_finish" or ptype == "step-finish":
+        finished_turns += 1
+    elif etype == "assistant":
+        msg = e.get("message") if isinstance(e.get("message"), dict) else {}
+        mid = msg.get("id")
+        if mid:
+            if mid not in seen_assistant_ids:
+                seen_assistant_ids.add(mid)
+                started_turns += 1
+        else:
+            started_turns += 1
+        content = msg.get("content")
+        if isinstance(content, list):
+            for blk in content:
+                if isinstance(blk, dict) and blk.get("type") == "tool_use" and blk.get("id"):
+                    pending_tools[blk["id"]] = (blk.get("name") or "", blk.get("input") or {})
+    elif etype == "user":
+        msg = e.get("message") if isinstance(e.get("message"), dict) else {}
+        content = msg.get("content")
+        if isinstance(content, list):
+            for blk in content:
+                if isinstance(blk, dict) and blk.get("type") == "tool_result":
+                    tid = blk.get("tool_use_id")
+                    tname, tinp = pending_tools.get(tid, ("", {}))
+                    if not isinstance(tinp, dict):
+                        tinp = {}
+                    cmd = tinp.get("command") or tinp.get("cmd") or ""
+                    cstr = flatten_text(blk.get("content"))
+                    is_err = bool(blk.get("is_error"))
+                    if not is_err and exit_code_re.search(cstr):
+                        is_err = True
+                    if is_err:
+                        csig = norm_ws(cmd) if cmd else (f"{tname}:{norm_ws(json.dumps(tinp, sort_keys=True))}" if tname else "")
+                        detail = (f"command: {cmd}\n" if cmd else f"tool: {tname}\n") + cstr[:1500]
+                        record_failure(csig, norm_err(cstr), detail)
+                    else:
+                        record_success()
+    elif etype == "tool_use":
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        status = state.get("status")
+        inp = state.get("input") if isinstance(state.get("input"), dict) else {}
+        tool = part.get("tool") or ""
+        cmd = inp.get("command") or inp.get("cmd") or ""
+        meta = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
+        exit_code = meta.get("exit")
+        err_txt = flatten_text(state.get("error"))
+        out_txt = flatten_text(state.get("output"))
+        if status == "error" or (isinstance(exit_code, int) and exit_code != 0) or bool(err_txt):
+            csig = norm_ws(cmd) if cmd else (f"{tool}:{norm_ws(json.dumps(inp, sort_keys=True))}" if tool else "")
+            combined = err_txt or out_txt or f"exit {exit_code}"
+            detail = (f"command: {cmd}\n" if cmd else f"tool: {tool}\n") + combined[:1500]
+            record_failure(csig, norm_err(combined), detail)
+        elif status == "completed":
+            record_success()
+    elif etype == "result":
+        nt = e.get("num_turns")
+        if isinstance(nt, int):
+            finished_turns = max(finished_turns, nt)
+    elif etype == "command_result":
+        cmd = e.get("command") or ""
+        ec = e.get("exit_code", 0)
+        rtxt = flatten_text(e.get("error") or e.get("output") or "")
+        if isinstance(ec, int) and ec != 0:
+            record_failure(norm_ws(cmd), norm_err(rtxt or f"exit {ec}"), f"command: {cmd}\n{rtxt[:1500]}")
+        else:
+            record_success()
 
 if os.path.isfile(log_path):
     with open(log_path, errors="replace") as fh:
         for raw in fh:
-            texts = [raw]
-            e = None
+            # The agent writes this log: a line that is not JSON, or holds unexpected types, is skipped.
             try:
                 e = json.loads(raw)
                 if isinstance(e, dict):
-                    texts.extend(collect_texts(e))
-            except ValueError:
-                e = None
-
-            for txt in texts:
-                for m in marker_re.finditer(txt):
-                    for tok in re.split(r"[,\s]+", m.group(1).strip()):
-                        if tok:
-                            add_path(tok)
-
-            if not isinstance(e, dict):
+                    inspect(e)
+            except Exception:
                 continue
-
-            etype = e.get("type")
-            part = e.get("part") if isinstance(e.get("part"), dict) else {}
-            ptype = part.get("type")
-
-            if etype == "step_start" or ptype == "step-start" or etype in ("turn", "turn_start"):
-                started_turns += 1
-            elif etype == "step_finish" or ptype == "step-finish":
-                finished_turns += 1
-            elif etype == "assistant":
-                msg = e.get("message") if isinstance(e.get("message"), dict) else {}
-                mid = msg.get("id")
-                if mid:
-                    if mid not in seen_assistant_ids:
-                        seen_assistant_ids.add(mid)
-                        started_turns += 1
-                else:
-                    started_turns += 1
-                content = msg.get("content")
-                if isinstance(content, list):
-                    for blk in content:
-                        if isinstance(blk, dict) and blk.get("type") == "tool_use" and blk.get("id"):
-                            pending_tools[blk["id"]] = (blk.get("name") or "", blk.get("input") or {})
-            elif etype == "user":
-                msg = e.get("message") if isinstance(e.get("message"), dict) else {}
-                content = msg.get("content")
-                if isinstance(content, list):
-                    for blk in content:
-                        if isinstance(blk, dict) and blk.get("type") == "tool_result":
-                            tid = blk.get("tool_use_id")
-                            tname, tinp = pending_tools.get(tid, ("", {}))
-                            if not isinstance(tinp, dict):
-                                tinp = {}
-                            cmd = tinp.get("command") or tinp.get("cmd") or ""
-                            cstr = flatten_text(blk.get("content"))
-                            is_err = bool(blk.get("is_error"))
-                            if not is_err and exit_code_re.search(cstr):
-                                is_err = True
-                            if is_err:
-                                csig = norm_ws(cmd) if cmd else (f"{tname}:{norm_ws(json.dumps(tinp, sort_keys=True))}" if tname else "")
-                                esig = norm_err(cstr)
-                                detail = (f"command: {cmd}\n" if cmd else f"tool: {tname}\n") + cstr[:1500]
-                                record_failure(csig, esig, detail)
-                            else:
-                                record_success()
-            elif etype == "tool_use":
-                state = part.get("state") if isinstance(part.get("state"), dict) else {}
-                status = state.get("status")
-                inp = state.get("input") if isinstance(state.get("input"), dict) else {}
-                tool = part.get("tool") or ""
-                cmd = inp.get("command") or inp.get("cmd") or ""
-                meta = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
-                exit_code = meta.get("exit")
-                err_txt = flatten_text(state.get("error"))
-                out_txt = flatten_text(state.get("output"))
-                if status == "error" or (isinstance(exit_code, int) and exit_code != 0) or bool(err_txt):
-                    csig = norm_ws(cmd) if cmd else (f"{tool}:{norm_ws(json.dumps(inp, sort_keys=True))}" if tool else "")
-                    combined = err_txt or out_txt or f"exit {exit_code}"
-                    esig = norm_err(combined)
-                    detail = (f"command: {cmd}\n" if cmd else f"tool: {tool}\n") + combined[:1500]
-                    record_failure(csig, esig, detail)
-                elif status == "completed":
-                    record_success()
-            elif etype == "error":
-                err_obj = e.get("error")
-                msg_txt = err_obj.get("message") if isinstance(err_obj, dict) else flatten_text(err_obj or e.get("message"))
-                if msg_txt:
-                    record_failure("", norm_err(msg_txt), msg_txt[:1500])
-            elif etype == "result":
-                nt = e.get("num_turns")
-                if isinstance(nt, int):
-                    finished_turns = max(finished_turns, nt)
-                if e.get("is_error"):
-                    rtxt = flatten_text(e.get("result") or e.get("errors") or "result error")
-                    record_failure("", norm_err(rtxt), rtxt[:1500])
-            elif etype == "command_result":
-                cmd = e.get("command") or ""
-                ec = e.get("exit_code", 0)
-                rtxt = flatten_text(e.get("error") or e.get("output") or "")
-                if isinstance(ec, int) and ec != 0:
-                    record_failure(norm_ws(cmd), norm_err(rtxt or f"exit {ec}"), f"command: {cmd}\n{rtxt[:1500]}")
-                else:
-                    record_success()
 
 if scope_paths:
     with open(detail_file, "w") as dfh:
@@ -1308,15 +1302,11 @@ if scope_paths:
     print("REASON=sandbox requested additional scope")
     sys.exit(0)
 
-if loop_threshold > 0 and (cmd_streak >= loop_threshold or err_streak >= loop_threshold):
+if loop_threshold > 0 and streak >= loop_threshold:
     with open(detail_file, "w") as dfh:
         dfh.write(last_detail + "\n" if last_detail else "")
-    if cmd_streak >= loop_threshold:
-        print("ACTION=LOOP_DETECTED")
-        print(f"REASON=identical failing command repeated {cmd_streak} times")
-    else:
-        print("ACTION=LOOP_DETECTED")
-        print(f"REASON=identical error repeated {err_streak} times")
+    print("ACTION=LOOP_DETECTED")
+    print(f"REASON=identical failing command and error repeated {streak} times")
     sys.exit(0)
 
 if max_turns > 0 and max(started_turns, finished_turns) > max_turns:
