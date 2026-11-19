@@ -1055,5 +1055,13 @@ unset -f docker need_image
 reload_hutch
 unset HUTCH_API_KEY
 
+# --- PR2 fixes: group D (cache overlays) ---
+reload_hutch
+KVF="$tmp/kvlast"; printf 'cache_overlays=\nmemory=2g\ncache_overlays=node_modules:/work/node_modules\n' >"$KVF"
+check "kv_get takes the last line of a key, so an appended setting overrides the template's" '
+  [[ "$(kv_get "$KVF" cache_overlays)" == "node_modules:/work/node_modules" && "$(kv_get "$KVF" memory)" == 2g &&
+     -z "$(kv_get "$KVF" missing)" ]]
+'
+
 echo "failures: $fails"
 [[ $fails -eq 0 ]]

@@ -38,9 +38,10 @@ gen_proxy_token() { echo "hutch-proxy-$(rand_hex 16)"; }
 
 # ---- provider, agent and model -------------------------------------------------------------------------------
 
-# kv_get prints the value of key $2 from key=value file $1 (the file is read, never executed; the first line wins).
+# kv_get prints the value of key $2 from key=value file $1 (the file is read, never executed; the last line wins, so
+# a setting appended to the template's empty one takes effect).
 kv_get() {
-  awk -v k="$2" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$1"
+  awk -v k="$2" 'index($0, k "=") == 1 { v = substr($0, length(k) + 2); f = 1 } END { if (f) print v }' "$1"
 }
 
 # setup_provider reads providers/<name>.conf, or ~/.hutch/providers/<name>.conf first, for HUTCH_PROVIDER (default
