@@ -446,16 +446,18 @@ docker_runtimes() { docker info --format '{{range $k, $v := .Runtimes}}{{println
 
 need_image() { docker image inspect "$1" >/dev/null 2>&1 || die "image $1 is missing; run hutch build"; }
 
-# gate_location emits one nginx location block that authenticates the sandbox's per-run HUTCH_PROXY_TOKEN, blocks
-# path traversal and query-param credential smuggling, injects the host's real provider key (${HUTCH_KEY}), and strips
-# alternative auth headers so the sandbox can never use another account on the upstream host.
+# gate_location emits one nginx location block that authenticates the sandbox's per-run HUTCH_PROXY_TOKEN, injects the
+# host's real provider key (${HUTCH_KEY}), and strips alternative auth headers so the sandbox can never use another
+# account on the upstream host. The request URI is forwarded as sent, so it must be plain: unreserved path characters
+# with no dot segments and no percent-encoding, and no query string except Claude Code's ?beta=true. That allowlist
+# closes path traversal and query-parameter credentials (?key=, ?%6bey=, ?access_token=, ...) at once.
 gate_location() {
   local matcher="$1" host="$2"
   printf '%s\n' \
     "  location $matcher {" \
     '    if ($hutch_token_ok = 0) { return 403 "hutch gate: invalid proxy token\n"; }' \
-    '    if ($request_uri ~* "(%2e|%2f|%5c|\.\.)") { return 403 "hutch gate: invalid path\n"; }' \
-    '    if ($args ~* "(^|&)(api_?key|key|token|auth)=") { return 403 "hutch gate: credential query param not allowed\n"; }' \
+    '    if ($request_uri !~ "^/[A-Za-z0-9._~/-]*(\?beta=true)?$") { return 403 "hutch gate: path or query not allowed\n"; }' \
+    '    if ($request_uri ~ "/\.\.?(/|\?|$)") { return 403 "hutch gate: invalid path\n"; }' \
     "    proxy_pass $UPSTREAM;" \
     "    proxy_ssl_server_name on;" \
     "    proxy_ssl_name ${host%%:*};" \
@@ -483,15 +485,16 @@ gate_conf() {
   printf '%s\n' \
     'log_format hutch_gate '"'"'$time_iso8601 $request_method $request_uri -> $status upstream=$upstream_status'"'"';' \
     'map_hash_bucket_size 128;' \
+    '# Plain map strings match ignoring case; the anchored case-sensitive regexes (~) require the exact token.' \
     'map $http_authorization $hutch_auth_state {' \
-    '  ""                             empty;' \
-    '  "Bearer ${HUTCH_PROXY_TOKEN}"  valid;' \
-    '  default                        invalid;' \
+    '  ""                                 empty;' \
+    '  "~^Bearer ${HUTCH_PROXY_TOKEN}$"   valid;' \
+    '  default                            invalid;' \
     '}' \
     'map $http_x_api_key $hutch_xkey_state {' \
-    '  ""                             empty;' \
-    '  "${HUTCH_PROXY_TOKEN}"         valid;' \
-    '  default                        invalid;' \
+    '  ""                                 empty;' \
+    '  "~^${HUTCH_PROXY_TOKEN}$"          valid;' \
+    '  default                            invalid;' \
     '}' \
     'map "$hutch_auth_state:$hutch_xkey_state" $hutch_token_ok {' \
     '  "valid:valid"  1;' \

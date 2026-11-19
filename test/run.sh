@@ -355,7 +355,7 @@ check "gate_conf enforces HUTCH_PROXY_TOKEN via nginx maps and strips alternativ
      "$gate_out" == *"proxy_set_header Proxy-Authorization \"\""* &&
      "$gate_out" == *"proxy_set_header Cookie \"\""* &&
      "$gate_out" == *"hutch gate: invalid path"* &&
-     "$gate_out" == *"hutch gate: credential query param not allowed"* ]]
+     "$gate_out" == *"hutch gate: path or query not allowed"* ]]
 '
 
 printf 'upstream=https://api.example.com\nkey_item=exactp\nclaude_base=/v1\npaths=/v1/chat/completions /v1/messages\nmodels=myrouter.tsv\n' >"$HUTCH_HOME/providers/exactp.conf"
@@ -376,16 +376,19 @@ if "map $http_authorization" not in conf or "$hutch_token_ok" not in conf:
     sys.exit(1)
 token = "hutch-proxy-deadbeef"
 rendered = conf.replace("${HUTCH_PROXY_TOKEN}", token)
-def map_auth(v):
-    if v == "": return "empty"
-    if f"\"Bearer {token}\" valid;" in re.sub(r" +", " ", rendered):
-        if v == f"Bearer {token}": return "valid"
-    return "invalid"
-def map_xkey(v):
-    if v == "": return "empty"
-    if f"\"{token}\" valid;" in re.sub(r" +", " ", rendered) and v == token:
-        return "valid"
-    return "invalid"
+def map_state(var, v):
+    # nginx map: exact strings first (ignoring case), then ~ regexes in order (case-sensitive), else default.
+    body = re.search(r"map \$" + var + r" \$\w+ \{(.*?)\n\}", rendered, re.S).group(1)
+    entries = re.findall(r"^\s*(\"[^\"]*\"|default)\s+(\w+);", body, re.M)
+    for k, val in entries:
+        if k != "default" and not k[1:-1].startswith("~") and k[1:-1].lower() == v.lower():
+            return val
+    for k, val in entries:
+        if k != "default" and k[1:-1].startswith("~") and re.search(k[2:-1], v):
+            return val
+    return dict(entries)["default"]
+def map_auth(v): return map_state("http_authorization", v)
+def map_xkey(v): return map_state("http_x_api_key", v)
 def map_ok(a, x):
     return 1 if f"{a}:{x}" in ("valid:valid", "valid:empty", "empty:valid") else 0
 cases = [
@@ -398,6 +401,12 @@ cases = [
     (f"Bearer {token}", "sk-attacker", 0),
     ("Bearer sk-attacker", token, 0),
     ("Bearer sk-attacker", "sk-attacker", 0),
+    (f"Bearer {token.upper()}", "", 0),
+    ("", token.upper(), 0),
+    (f"bearer {token}", "", 0),
+    (f"Bearer {token}x", "", 0),
+    (f"xBearer {token}", "", 0),
+    ("", f"{token}x", 0),
 ]
 for a, x, want in cases:
     got = map_ok(map_auth(a), map_xkey(x))
@@ -1001,6 +1010,25 @@ for k in sk-ant-api03-AbC_d-1 'abc+/=' eyJh.eyJ.sig 'id:secret~1'; do
   (HUTCH_API_KEY="$k" gate_up hutch-gate-gc2 "$tmp/gc.conf" "$tmp/gc.log" gctask tok) >/dev/null 2>&1 || gc_bad="$gc_bad refused[$k]"
 done
 check "gate_up refuses keys with \$, quotes, backslashes, braces, ; or whitespace and accepts token-like keys" '[[ -z "$gc_bad" ]] || { echo "    $gc_bad"; false; }'
+
+check "the gate forwards only plain paths and no query but ?beta=true, so credential query params cannot pass" '
+  GATE_CONF_SAMPLE="$(gate_conf)" python3 -I - <<'\''PYEOF'\''
+import os, re
+conf = os.environ["GATE_CONF_SAMPLE"]
+allow = re.search(r"\$request_uri !~ \"([^\"]*)\"\) \{ return 403", conf).group(1)
+deny = re.search(r"\$request_uri ~ \"([^\"]*)\"\) \{ return 403", conf).group(1)
+def forwarded(u): return re.search(allow, u) is not None and re.search(deny, u) is None
+ok = ["/zen/go/v1/chat/completions", "/inference/go/anthropic/v1/messages?beta=true",
+      "/inference/go/anthropic/v1/messages/count_tokens?beta=true", "/zen/go/v1/models/glm-5.1", "/zen/go/v1/a..b"]
+p = "/zen/go/v1/chat/completions"
+bad = [p + q for q in ["?key=x", "?%6bey=x", "?%61pi_key=x", "?access_token=x", "?api-key=x", "?x-api-key=x",
+                       "?a=1;key=x", "?beta=true&key=x", "?key=x&beta=true", "?beta=TRUE", "?", "#?key=x"]]
+bad += ["/zen/go/v1/../../x", "/zen/go/v1/a/../b", "/zen/go/v1/./x", "/zen/go/v1/x/..", "/zen/go/v1/%2e%2e/x",
+        "/zen/go/v1/x%2fy", "/zen/go/v1/x\\..\\y", "/zen/go/v1/x?beta=true/.."]
+assert all(forwarded(u) for u in ok), [u for u in ok if not forwarded(u)]
+assert not any(forwarded(u) for u in bad), [u for u in bad if forwarded(u)]
+PYEOF
+'
 
 unset -f docker need_image
 reload_hutch
