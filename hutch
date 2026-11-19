@@ -2,7 +2,7 @@
 # hutch: a coding agent (opencode or Claude Code) does one bounded task in an isolated container; the host agent briefs and verifies.
 #   hutch status                                   machine and project state; start here (exit 3: project not set up, 4: machine not set up)
 #   hutch init [--in-repo]                         create this project's config from the template (~/.hutch/projects/<name>, or <repo>/.hutch)
-#   hutch build                                    build the base and project images, pull the gate, create the networks
+#   hutch build                                    build the base and project images, pull the gate, create the egress network
 #   hutch new <task> [<allow> <brief>] [options]   clone base branch; options: --allow <glob> --allow-file <f> --brief <f> --opened <f> --context <spec>
 #   hutch run [options] <task>                     run agent with watchdog; options: --context <spec> --max-turns <N> --max-timeout <S> --loop-threshold <N>
 #   hutch batch [options] <task1> <task2>...       run tasks concurrently; options: --max-parallel <N> --max-turns <N> --max-timeout <S> --loop-threshold <N>
@@ -28,7 +28,6 @@ BASE_IMAGE=hutch-base:latest
 # The gate: nginx, unprivileged, pinned by digest. It holds the provider key for one sandbox command and forwards only
 # the provider's API paths; the sandbox has no other way out.
 GATE_IMAGE=nginxinc/nginx-unprivileged:1.27.5-alpine@sha256:65e3e85dbaed8ba248841d9d58a899b6197106c23cb0ff1a132b7bfe0547e4c0
-NET_INTERNAL=hutch-internal
 NET_EGRESS=hutch-egress
 # Kinds in the model tables that count as strong models for the pro-paths rule.
 PRO_KINDS="design concurrency"
@@ -519,8 +518,9 @@ gate_conf() {
 }
 
 # gate_up starts gate $1 for one sandbox command of task $4 with the provider key and per-run proxy token $5, writes
-# its template to file $2, and waits until it answers. gate_down (also run on exit) appends its access log to file $3
-# and removes it.
+# its template to file $2, and waits until it answers. The gate and that one sandbox share a new internal network
+# (GATE_NET, no route out), so sandboxes of other runs, tasks and projects cannot reach each other. gate_down (also
+# run on exit) appends the gate's access log to file $3 and removes the gate and the network.
 gate_up() {
   local name="$1" conf="$2" key proxy_token _
   proxy_token="${5:-$(gen_proxy_token)}"
@@ -530,14 +530,17 @@ gate_up() {
   (LC_ALL=C; [[ "$key" =~ ^[A-Za-z0-9._~+/=:-]+$ ]]) ||
     die "API key contains unsafe characters for gate configuration (allowed: letters, digits and ._~+/=:-)"
   gate_conf >"$conf"
-  GATE_NAME="$name"; GATE_LOG="$3"
+  GATE_LOG="$3"
+  GATE_NET="hutch-net-${name#hutch-gate-}"
+  docker network create --internal --label "hutch.project=$NAME" --label "hutch.task=$4" "$GATE_NET" >/dev/null
+  GATE_NAME="$name"
   HUTCH_KEY="$key" HUTCH_PROXY_TOKEN="$proxy_token" docker run -d --rm --name "$name" --network "$NET_EGRESS" --cap-drop ALL \
     --security-opt no-new-privileges --read-only --tmpfs /tmp:mode=1777 --tmpfs /etc/nginx/conf.d:mode=1777 \
     --memory 256m --pids-limit 64 --label "hutch.project=$NAME" --label "hutch.task=$4" -e HUTCH_KEY -e HUTCH_PROXY_TOKEN \
     -v "$conf:/etc/nginx/templates/default.conf.template:ro" "$GATE_IMAGE" >/dev/null
-  docker network connect "$NET_INTERNAL" "$name"
-  GATE_IP="$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NET_INTERNAL\").IPAddress}}" "$name")"
-  [[ "$GATE_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "the gate $name has no address on $NET_INTERNAL ('$GATE_IP')"
+  docker network connect "$GATE_NET" "$name"
+  GATE_IP="$(docker inspect -f "{{(index .NetworkSettings.Networks \"$GATE_NET\").IPAddress}}" "$name")"
+  [[ "$GATE_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "the gate $name has no address on $GATE_NET ('$GATE_IP')"
   for _ in $(seq 1 50); do
     docker exec "$name" wget -q -O /dev/null http://127.0.0.1:8080/hutch-gate-health 2>/dev/null && return 0
     sleep 0.2
@@ -547,10 +550,21 @@ gate_up() {
 }
 
 gate_down() {
-  [[ -n "${GATE_NAME:-}" ]] || return 0
-  docker logs "$GATE_NAME" >>"$GATE_LOG" 2>&1 || true
-  docker rm -f "$GATE_NAME" >/dev/null 2>&1 || true
-  GATE_NAME=""
+  local _
+  if [[ -n "${GATE_NAME:-}" ]]; then
+    docker logs "$GATE_NAME" >>"$GATE_LOG" 2>&1 || true
+    docker rm -f "$GATE_NAME" >/dev/null 2>&1 || true
+    GATE_NAME=""
+  fi
+  [[ -n "${GATE_NET:-}" ]] || return 0
+  # A sandbox that is still being removed keeps the network busy for a moment.
+  for _ in 1 2 3 4 5; do
+    docker network rm "$GATE_NET" >/dev/null 2>&1 && { GATE_NET=""; return 0; }
+    docker network inspect "$GATE_NET" >/dev/null 2>&1 || { GATE_NET=""; return 0; }
+    sleep 1
+  done
+  echo "hutch: could not remove network $GATE_NET; remove it with: docker network rm $GATE_NET" >&2
+  GATE_NET=""
 }
 
 # ---- copy-on-write dependency and build cache overlays ---------------------------------------------------------
@@ -737,8 +751,8 @@ opencode_json() {
     '}'
 }
 
-# sandbox runs SANDBOX_CMD in the project image: internal network with no route out, the gate as the only peer (it
-# holds the key), no capabilities, only the task's files mounted. Extra docker flags come in "$@".
+# sandbox runs SANDBOX_CMD in the project image: its own internal network with no route out, the gate as the only peer
+# (it holds the key), no capabilities, only the task's files mounted. Extra docker flags come in "$@".
 sandbox() {
   local task="$1"; shift
   local dir out gate url probe proxy_token agent_args extra
@@ -794,7 +808,7 @@ sandbox() {
   local rc=0
   # shellcheck disable=SC2046 # limit_args prints whole docker flags
   docker run --rm ${SANDBOX_CONTAINER:+--name "$SANDBOX_CONTAINER"} "$@" \
-    --network "$NET_INTERNAL" --cap-drop ALL --security-opt no-new-privileges \
+    --network "$GATE_NET" --cap-drop ALL --security-opt no-new-privileges \
     ${RUNTIME:+--runtime "$RUNTIME"} $(limit_args) --tmpfs /tmp:exec,size=4g \
     -v "$dir/repo:/work" -v "$dir/brief.md:/task/brief.md:ro" -v "$CONF/primer.md:/task/primer.md:ro" \
     -v "${HUTCH_DIR}/rules/checklist.md:/task/checklist.md:ro" -v "$out/sandbox:/out" \
@@ -921,10 +935,11 @@ cmd_build() {
   need_docker
   docker build -t "$BASE_IMAGE" --build-arg HUTCH_UID="$(id -u)" --build-arg HUTCH_GID="$(id -g)" "${HUTCH_DIR}/image"
   docker pull -q "$GATE_IMAGE" >/dev/null
-  docker network inspect "$NET_INTERNAL" >/dev/null 2>&1 || docker network create --internal "$NET_INTERNAL" >/dev/null
   docker network inspect "$NET_EGRESS" >/dev/null 2>&1 || docker network create "$NET_EGRESS" >/dev/null
-  # The allowlist proxy of earlier versions held no key but is no longer used: the gate replaced it.
+  # The allowlist proxy of earlier versions held no key but is no longer used: the gate replaced it. The shared
+  # internal network of earlier versions is replaced by one network per run (gate_up).
   docker rm -f hutch-proxy >/dev/null 2>&1 || true
+  docker network rm hutch-internal >/dev/null 2>&1 || true
   CONF=""
   try_resolve || true
   if [[ -z "$CONF" ]]; then echo "base image and gate ready; no project here is set up, so no project image"; return; fi

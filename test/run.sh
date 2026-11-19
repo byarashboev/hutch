@@ -1030,8 +1030,30 @@ assert not any(forwarded(u) for u in bad), [u for u in bad if forwarded(u)]
 PYEOF
 '
 
+export HUTCH_API_KEY="sk-gc-test"
+SANDBOX_CMD=(true)
+: >"$tmp/gc_docker"
+AGENT=opencode sandbox ctx1 >/dev/null
+AGENT=opencode sandbox ctx1 >/dev/null
+gc_nets="$(awk '$1 == "network" && $2 == "create" { print $NF }' "$tmp/gc_docker")"
+gc_net1="$(printf '%s\n' "$gc_nets" | sed -n 1p)"; gc_net2="$(printf '%s\n' "$gc_nets" | sed -n 2p)"
+gc_sbx="$(grep -n -- "^run .*--network $gc_net1 " "$tmp/gc_docker" | grep -v -- "$GATE_IMAGE" | cut -d: -f1)"
+gc_rm="$(grep -nx -- "network rm $gc_net1" "$tmp/gc_docker" | cut -d: -f1)"
+gc_log="$(cat "$tmp/gc_docker")"
+check "each sandbox run gets its own internal network, shared only with its gate and removed afterwards" '
+  [[ "$gc_net1" == hutch-net-ctxproj-ctx1-* && -n "$gc_net2" && "$gc_net1" != "$gc_net2" &&
+     "$gc_log" == *"network create --internal "*" $gc_net1"* &&
+     "$gc_log" == *"network connect $gc_net1 hutch-gate-ctxproj-ctx1-"* &&
+     "$gc_log" == *"network rm $gc_net2"* && "$gc_log" != *hutch-internal* &&
+     -n "$gc_sbx" && -n "$gc_rm" && $gc_sbx -lt $gc_rm ]]'
+: >"$tmp/gc_docker"
+out="$( (GC_GATE_FAIL=1 AGENT=opencode sandbox ctx1) 2>&1)"; rc=$?
+gc_net3="$(awk '$1 == "network" && $2 == "create" { print $NF }' "$tmp/gc_docker")"
+check "the run's network is removed when the gate fails to start" '
+  [[ $rc -ne 0 && "$out" == *"has no address"* && -n "$gc_net3" ]] && grep -qx -- "network rm $gc_net3" "$tmp/gc_docker"'
 unset -f docker need_image
 reload_hutch
+unset HUTCH_API_KEY
 
 echo "failures: $fails"
 [[ $fails -eq 0 ]]

@@ -119,6 +119,8 @@ if [[ -n "${HUTCH_RUNTIME:-}" ]]; then
   check "isolation: the sandbox runs under $HUTCH_RUNTIME, not the host kernel" '[[ "$out" == *"kernel "* && "$out" != *"kernel $(uname -r)"* ]]'
 fi
 check "isolation: the gate is removed afterwards and its log is kept" '[[ -z "$(docker ps -q --filter name=hutch-gate-e2e-demo)" && -s "$HUTCH_HOME/state/e2e-demo/out/clean/gate.log" ]]'
+# --- PR2 fixes: group C (gate, key, networks) ---
+check "isolation: the run's own internal network is removed afterwards" '[[ -z "$(docker network ls -q --filter label=hutch.project=e2e-demo)" ]]'
 
 # Workstream 3: Warm read-only dependency overlay with ephemeral CoW writes (never mutating host).
 mkdir -p "$repo/node_modules/demo-dep"
