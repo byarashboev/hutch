@@ -158,7 +158,6 @@ resolve_project() {
   fi
   STATE="${HUTCH_HOME}/state/${NAME}"
   PROJECT_IMAGE="hutch-${NAME}:latest"
-  CACHE_VOLUME="hutch-${NAME}-cache"
 }
 
 # try_resolve resolves the project when that works and fails quietly otherwise (resolve_project exits on errors).
@@ -574,6 +573,8 @@ OVERLAY_DOCKER_ARGS=()
 OVERLAY_COW_PAIRS=()
 OVERLAY_VOLUMES=()
 OVERLAY_TMP_DIRS=()
+# cache_mount (a project cache volume) is gone: tasks mount caches read-only, so nothing could ever fill the volume.
+CACHE_MOUNT_GONE="cache_mount is no longer supported: remove it, and bake the cache into the Dockerfile or mount a host cache directory with cache_overlays"
 
 cache_overlays_spec() {
   local s="${HUTCH_CACHE_OVERLAYS:-}"
@@ -619,11 +620,11 @@ validate_overlay_entry() {
 }
 
 overlay_up() {
-  local run_tag="$1" spec raw_mode mode uid gid idx=0 entry host_raw host_dir ctr_path ov_base vol m
+  local run_tag="$1" spec raw_mode mode uid gid idx=0 entry host_raw host_dir ctr_path ov_base vol
   OVERLAY_DOCKER_ARGS=(); OVERLAY_COW_PAIRS=(); OVERLAY_VOLUMES=(); OVERLAY_TMP_DIRS=()
+  [[ -z "$(conf_get cache_mount)" ]] || die "$CONF/config: $CACHE_MOUNT_GONE"
   spec="$(cache_overlays_spec)"
-  m="$(conf_get cache_mount)"
-  [[ -n "$spec" || -n "$m" ]] || return 0
+  [[ -n "$spec" ]] || return 0
   raw_mode="${HUTCH_CACHE_OVERLAY_MODE:-$(conf_get cache_overlay_mode)}"
   raw_mode="${raw_mode:-auto}"
   mode="$(resolve_overlay_mode)"
@@ -662,15 +663,6 @@ overlay_up() {
     fi
     idx=$((idx + 1))
   done
-  if [[ -n "$m" ]]; then
-    validate_overlay_entry "volume:$m"
-    if [[ "$mode" == ro ]]; then
-      OVERLAY_DOCKER_ARGS+=(-v "${CACHE_VOLUME}:${m}:ro")
-    else
-      OVERLAY_DOCKER_ARGS+=(-v "${CACHE_VOLUME}:/.hutch-ro/cache:ro" --tmpfs "${m}:exec,uid=${uid},gid=${gid},mode=0755")
-      OVERLAY_COW_PAIRS+=("/.hutch-ro/cache:${m}")
-    fi
-  fi
 }
 
 overlay_down() {
@@ -909,7 +901,7 @@ cmd_status() {
     if docker_runtimes | grep -qx -- "$RUNTIME"; then line runtime "$RUNTIME ok"
     else line runtime "$RUNTIME MISSING (not in docker info; AGENTS.md, gVisor)"; [[ $rc -eq 0 ]] && rc=4; fi
   fi
-  local ov_spec ov_entry ov_host ov_ctr cm
+  local ov_spec ov_entry ov_host ov_ctr
   ov_spec="$(cache_overlays_spec)"
   if [[ -n "$ov_spec" ]]; then
     local ov_mode; ov_mode="$(resolve_overlay_mode)"
@@ -921,12 +913,8 @@ cmd_status() {
       else line "cache $ov_ctr" "MISSING ($ov_host not found)"; [[ $rc -eq 0 ]] && rc=4; fi
     done
   fi
-  cm="$(conf_get cache_mount)"
-  if [[ -n "$cm" ]]; then
-    if docker volume inspect "$CACHE_VOLUME" >/dev/null 2>&1; then line "cache $cm" "ok (ro overlay from volume $CACHE_VOLUME)"
-    else line "cache $cm" "ready (empty volume $CACHE_VOLUME; created on first use)"; fi
-  fi
-  [[ -n "$ov_spec" || -n "$cm" ]] || line cache "none (image-baked)"
+  if [[ -n "$(conf_get cache_mount)" ]]; then line cache_mount "$CACHE_MOUNT_GONE"; [[ $rc -eq 0 ]] && rc=3; fi
+  [[ -n "$ov_spec" ]] || line cache "none (image-baked)"
   line tasks "$(ls "${STATE}/work" 2>/dev/null | tr '\n' ' ')"
   return "$rc"
 }

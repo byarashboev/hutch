@@ -477,7 +477,7 @@ OVREPO="$tmp/ovrepo"; mkdir -p "$OVREPO/node_modules/pkg"
 printf 'ok\n' >"$OVREPO/node_modules/pkg/index.js"
 OVCONF="$tmp/ovconf"; mkdir -p "$OVCONF"
 printf 'cache_overlays=node_modules:/work/node_modules\ncache_overlay_mode=cow-tmpfs\n' >"$OVCONF/config"
-CONF="$OVCONF"; REPO="$OVREPO"; STATE="$tmp/ovstate"; NAME=ovproj; CACHE_VOLUME="hutch-ovproj-cache"
+CONF="$OVCONF"; REPO="$OVREPO"; STATE="$tmp/ovstate"; NAME=ovproj
 
 overlay_up testov
 check "cow-tmpfs mounts host cache strictly read-only with an ephemeral writable tmpfs target" '
@@ -506,15 +506,6 @@ check "overlay_down removes docker overlay volume and temp directories" '
 '
 unset -f docker
 
-printf 'cache_mount=/cache/go-build\ncache_overlay_mode=cow-tmpfs\n' >"$OVCONF/config"
-overlay_up testcm
-check "legacy cache_mount is mounted read-only under /.hutch-ro/cache with ephemeral tmpfs overlay" '
-  [[ "${OVERLAY_DOCKER_ARGS[*]}" == *"-v hutch-ovproj-cache:/.hutch-ro/cache:ro"* &&
-     "${OVERLAY_DOCKER_ARGS[*]}" == *"--tmpfs /cache/go-build:exec,"* &&
-     "${OVERLAY_COW_PAIRS[*]}" == *"/.hutch-ro/cache:/cache/go-build"* ]]
-'
-overlay_down
-
 # status cache readiness
 docker() {
   case "$1" in
@@ -539,7 +530,7 @@ unset -f docker have_key try_resolve
 reload_hutch
 
 # offline with cow-tmpfs mounts and wraps verify command cleanly, then cleans up
-CONF="$OVCONF"; REPO="$OVREPO"; STATE="$tmp/ovstate"; NAME=ovproj; CACHE_VOLUME="hutch-ovproj-cache"
+CONF="$OVCONF"; REPO="$OVREPO"; STATE="$tmp/ovstate"; NAME=ovproj
 printf 'cache_overlays=node_modules:/work/node_modules\ncache_overlay_mode=cow-tmpfs\n' >"$OVCONF/config"
 docker() { printf '%s\n' "$@" >"$tmp/ovoffline"; }
 offline -v "$tmp/t:/work" img -- bash /task/verify.sh
@@ -1090,6 +1081,20 @@ printf 'cache_overlays=node_modules:/work/node_modules\ncache_overlay_mode=docke
 out="$( (overlay_up testdo) 2>&1)"; rc=$?
 check "docker-overlay stops with a clear error when the overlay volume cannot be mounted" '[[ $rc -ne 0 && "$out" == *"cannot be mounted"* && ! -e "$STATE/tmp/ov-testdo-0" ]]'
 unset -f uname docker
+reload_hutch
+
+# cache_mount is removed: its volume was mounted read-only and nothing could ever fill it. A config that still sets it
+# is refused with a pointer to cache_overlays instead of running without the cache it expects.
+CONF="$OVCONF"; REPO="$OVREPO"; STATE="$tmp/ovstate"; NAME=ovproj
+printf 'cache_mount=/cache/go-build\n' >"$OVCONF/config"
+out="$( (overlay_up testcm) 2>&1)"; rc=$?
+check "a config with cache_mount is refused with a pointer to cache_overlays" '[[ $rc -ne 0 && "$out" == *"cache_mount"*"cache_overlays"* ]]'
+docker() { return 0; }
+have_key() { return 0; }
+try_resolve() { return 0; }
+out="$(cmd_status)"; rc=$?
+check "status flags cache_mount as unsupported and exits 3" '[[ $rc -eq 3 && "$out" == *"cache_mount"*"no longer supported"* ]]'
+unset -f docker have_key try_resolve
 reload_hutch
 
 echo "failures: $fails"

@@ -4,8 +4,6 @@ base_branch=main
 # ERE of the dependency manifests copied into the image build (from the base branch), so the image can warm its
 # caches. Leave empty when the Dockerfile needs no project files.
 manifests=
-# Container path of a persistent cache volume shared as a read-only base with an ephemeral CoW overlay per task. Optional.
-cache_mount=
 # Read-only host dependency/cache overlays mounted with ephemeral per-run CoW upper layers (never mutating the host).
 # Space-separated host_path:container_path pairs (relative host paths resolve from repo root; ~/ expands to $HOME).
 # Example: cache_overlays=node_modules:/work/node_modules ~/.cache/go-build:/cache/go-build
