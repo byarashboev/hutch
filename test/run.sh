@@ -1141,6 +1141,16 @@ check "N1/N2: Ctrl-C to a throttled batch's group stops and cleans up every run,
   [[ "$(grep -c "^network ls " "$STATE/docker.log")" == 2 ]] &&
   ! kill -0 "$(cat "$STATE/sleep_ra")" 2>/dev/null && ! kill -0 "$(cat "$STATE/sleep_rb")" 2>/dev/null'
 
+# N3: an interrupted run records its exit code, so hutch ls shows it and an opencode follow-up (hutch say) can start.
+docker() { return 0; }
+# The second sleep keeps the job from writing its own exit code after its first child is killed.
+sandbox() { sleep 30; sleep 2; }
+(cmd_run ra) >/dev/null 2>&1 &
+bpid=$!
+sleep 1; kill -TERM "$bpid"; wait "$bpid"; rc=$?
+check "N3: an interrupted run writes its exit code" '[[ $rc -eq 143 && "$(cat "$STATE/out/ra/exit.code" 2>/dev/null)" == 143 ]]'
+unset -f docker
+
 unset -f r_pgrun
 reload_hutch
 CONF="${r_saved[0]}" STATE="${r_saved[1]}" NAME="${r_saved[2]}" REPO="${r_saved[3]}" PROJECT_IMAGE="${r_saved[4]}"

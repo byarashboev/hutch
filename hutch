@@ -1419,11 +1419,13 @@ stop_sandbox_run() {
   fi
 }
 
-# run_interrupted stops the running sandbox (RUN_JOB, RUN_TAIL, SANDBOX_CONTAINER) when hutch run gets INT or TERM.
+# run_interrupted stops the running sandbox (RUN_JOB, RUN_TAIL, SANDBOX_CONTAINER) when hutch run gets INT or TERM, and
+# records the signal's exit code in RUN_OUT.
 run_interrupted() {
   # Ignored, not reset: a second signal (batch's TERM after Ctrl-C, or a second Ctrl-C) must not end the cleanup.
   trap '' INT TERM
   stop_sandbox_run "${SANDBOX_CONTAINER:-}" "${RUN_JOB:-}" "${RUN_TAIL:-}"
+  echo "$1" >"$RUN_OUT/exit.code"
   echo "hutch: the run was interrupted and its sandbox stopped" >&2
   exit "$1"
 }
@@ -1525,7 +1527,7 @@ cmd_run() {
   SANDBOX_CONTAINER="hutch-run-${NAME}-${task}-$$-${RUN_ID}"
   local job
   # Ctrl-C or hutch batch stopping this run also stops its sandbox and gate.
-  RUN_JOB=""; RUN_TAIL=""
+  RUN_JOB=""; RUN_TAIL=""; RUN_OUT="$out"
   trap 'run_interrupted 130' INT
   trap 'run_interrupted 143' TERM
   if [[ "$AGENT" == opencode ]]; then
