@@ -1070,5 +1070,27 @@ check "cow-tmpfs copies the cache as real files, so writes change the copy and n
      "$(cat "$COWD/pkg/index.js")" == changed && "$(cat "$COWS/pkg/index.js")" == base ]]
 '
 
+# auto: docker volume create accepts overlay options it cannot mount (Docker Desktop, WSL2), so a probe container
+# decides; when it fails, auto falls back to cow-tmpfs and an explicit docker-overlay stops with a clear error.
+CONF="$OVCONF"; REPO="$OVREPO"; STATE="$tmp/ovstate"; NAME=ovproj; PROJECT_IMAGE=hutch-ovproj:latest
+uname() { echo Linux; }
+docker() { printf '%s\n' "$*" >>"$tmp/ovprobe"; [[ "$1" != run ]]; }
+printf 'cache_overlays=node_modules:/work/node_modules\ncache_overlay_mode=auto\n' >"$OVCONF/config"
+: >"$tmp/ovprobe"
+overlay_up testauto
+check "auto probes the overlay volume and falls back to cow-tmpfs when it cannot be mounted" '
+  grep -q "^run .*hutch-ov-ovproj-testauto-0:" "$tmp/ovprobe" &&
+  grep -q "^volume rm -f hutch-ov-ovproj-testauto-0" "$tmp/ovprobe" &&
+  [[ ${#OVERLAY_VOLUMES[@]} -eq 0 && ! -e "$STATE/tmp/ov-testauto-0" &&
+     "${OVERLAY_COW_PAIRS[*]}" == "/.hutch-ro/ov0:/work/node_modules" &&
+     "${OVERLAY_DOCKER_ARGS[*]}" == *"-v $OVREPO/node_modules:/.hutch-ro/ov0:ro"* ]]
+'
+overlay_down
+printf 'cache_overlays=node_modules:/work/node_modules\ncache_overlay_mode=docker-overlay\n' >"$OVCONF/config"
+out="$( (overlay_up testdo) 2>&1)"; rc=$?
+check "docker-overlay stops with a clear error when the overlay volume cannot be mounted" '[[ $rc -ne 0 && "$out" == *"cannot be mounted"* && ! -e "$STATE/tmp/ov-testdo-0" ]]'
+unset -f uname docker
+reload_hutch
+
 echo "failures: $fails"
 [[ $fails -eq 0 ]]

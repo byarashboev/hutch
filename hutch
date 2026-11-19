@@ -637,14 +637,20 @@ overlay_up() {
       ov_base="${STATE}/tmp/ov-${run_tag}-${idx}"
       mkdir -p "$ov_base/upper" "$ov_base/work"
       vol="hutch-ov-${NAME}-${run_tag}-${idx}"
+      # volume create accepts options the daemon cannot mount (Docker Desktop, WSL2: the host path is not in its VM);
+      # the mount fails only when a container starts, so a throwaway container proves it first.
       if docker volume create --driver local --opt type=overlay --opt device=overlay \
-        --opt "o=lowerdir=${host_dir},upperdir=${ov_base}/upper,workdir=${ov_base}/work" "$vol" >/dev/null 2>&1; then
+        --opt "o=lowerdir=${host_dir},upperdir=${ov_base}/upper,workdir=${ov_base}/work" "$vol" >/dev/null 2>&1 &&
+        docker run --rm --network none ${RUNTIME:+--runtime "$RUNTIME"} -v "${vol}:/probe" "$PROJECT_IMAGE" true \
+          >/dev/null 2>&1; then
         OVERLAY_VOLUMES+=("$vol")
         OVERLAY_TMP_DIRS+=("$ov_base")
         OVERLAY_DOCKER_ARGS+=(-v "${vol}:${ctr_path}")
       else
+        docker volume rm -f "$vol" >/dev/null 2>&1 || true
         /bin/rm -rf "$ov_base"
-        [[ "$raw_mode" == auto ]] || die "failed to create overlay volume $vol for $host_dir"
+        [[ "$raw_mode" == auto ]] ||
+          die "overlay volume $vol for $host_dir cannot be mounted (docker-overlay needs a Docker daemon that sees host paths; use cache_overlay_mode=cow-tmpfs)"
         OVERLAY_DOCKER_ARGS+=(-v "${host_dir}:/.hutch-ro/ov${idx}:ro" --tmpfs "${ctr_path}:exec,uid=${uid},gid=${gid},mode=0755")
         OVERLAY_COW_PAIRS+=("/.hutch-ro/ov${idx}:${ctr_path}")
       fi
