@@ -1407,12 +1407,15 @@ stop_sandbox_run() {
     kill "$job_pid" 2>/dev/null || true
     wait "$job_pid" 2>/dev/null || true
   fi
-  # A job killed while gate_up runs can miss its gate, which holds the key: remove this run's gates by name
-  # (hutch-gate-<project>-<task>-<pid>-, as sandbox names them).
+  # A job killed while gate_up runs can miss its gate, which holds the key, and its network: remove this run's gates
+  # and networks by name (hutch-gate-<project>-<task>-<pid>- and hutch-net-..., as sandbox and gate_up name them).
   if [[ -n "$ctr" ]] && command -v docker >/dev/null 2>&1; then
     local gate_prefix g
     gate_prefix="hutch-gate-${ctr#hutch-run-}"; gate_prefix="${gate_prefix%-*}-"
     for g in $(docker ps -aq --filter "name=$gate_prefix" 2>/dev/null); do docker rm -f "$g" >/dev/null 2>&1 || true; done
+    for g in $(docker network ls -q --filter "name=hutch-net-${gate_prefix#hutch-gate-}" 2>/dev/null); do
+      docker network rm "$g" >/dev/null 2>&1 || true
+    done
   fi
 }
 
