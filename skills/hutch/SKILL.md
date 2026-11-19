@@ -39,7 +39,7 @@ themselves.
 
 ## 2. Run one task (Context Pre-Packing + Watchdog)
 
-1. **Think before briefing:** Surface any ambiguous requirements or design tradeoffs to the user upfront (or run `HUTCH_PHASE=design` first) so the headless sandbox receives an unambiguous brief and never guesses or stalls. Write `brief.md`: the goal, exact files to change and why, required behavior and tests, checks to run, commit steps, and out-of-scope boundaries. Short and precise.
+1. **Think before briefing:** Surface any ambiguous requirements or design tradeoffs to the user upfront (or run `HUTCH_PHASE=design` first; before adding "Reviewer notes" to `out/<task>/sandbox/design-notes.md`, check it is a regular file, not a symlink: `test -f <file> && test ! -L <file>`) so the headless sandbox receives an unambiguous brief and never guesses or stalls. Write `brief.md`: the goal, exact files to change and why, required behavior and tests, checks to run, commit steps, and out-of-scope boundaries. Short and precise.
 2. Write an allow file (or pass `--allow <glob>`): bash globs of the expected paths, one per line.
 3. Create the task with **pre-packed context** (`--context path[:start-end]`) so the inner agent starts coding immediately instead of wasting turns grepping/reading files you already found:
    ```sh

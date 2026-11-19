@@ -147,7 +147,8 @@ Ask these questions together, each with your drafted answer and the reason for i
    (`hutch models` shows the table). Tasks that touch `pro-paths` or open protected paths are refused unless the kind is
    a strong one (`design` or `concurrency`). A mixed task can run `HUTCH_PHASE=design` on a strong model first (it writes
    `/out/design-notes.md`, i.e. `out/<task>/sandbox/design-notes.md` on the host), then `HUTCH_PHASE=build` with a cheaper kind; add a "Reviewer notes" section to the design
-   notes to correct them before the build.
+   notes to correct them before the build. The sandbox writes that directory, so before editing a file there check that
+   it is a regular file, not a symlink (`test -f <file> && test ! -L <file>`).
 7. **Parallel fan-out**: run independent tasks concurrently with
    `hutch batch [--max-parallel <N>] [--max-turns <N>] [--max-timeout <S>] [--loop-threshold <N>] <task1> <task2> ...`
    (or concurrent `hutch run` invocations). Every run gets unique gate names, proxy tokens, CoW overlays, and per-task
