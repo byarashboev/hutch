@@ -702,6 +702,11 @@ EOF
 }
 
 cleanup_runtime() {
+  # A sandbox that still runs (hutch was stopped by a signal) keeps the network busy: remove it first.
+  if [[ -n "${RUNNING_SANDBOX:-}" ]]; then
+    docker rm -f "$RUNNING_SANDBOX" >/dev/null 2>&1 || true
+    RUNNING_SANDBOX=""
+  fi
   gate_down
   overlay_down
 }
@@ -810,8 +815,9 @@ sandbox() {
     run_cmd=(bash -c "$(overlay_cow_script)" _ "${SANDBOX_CMD[@]}")
   fi
   local rc=0
+  RUNNING_SANDBOX="${SANDBOX_CONTAINER:-hutch-run-${NAME}-${task}-$$-${run_id}}"
   # shellcheck disable=SC2046 # limit_args prints whole docker flags
-  docker run --rm ${SANDBOX_CONTAINER:+--name "$SANDBOX_CONTAINER"} "$@" \
+  docker run --rm --name "$RUNNING_SANDBOX" "$@" \
     --network "$GATE_NET" --cap-drop ALL --security-opt no-new-privileges \
     ${RUNTIME:+--runtime "$RUNTIME"} $(limit_args) --tmpfs /tmp:exec,size=4g \
     -v "$dir/repo:/work" -v "$dir/brief.md:/task/brief.md:ro" -v "$CONF/primer.md:/task/primer.md:ro" \
@@ -820,6 +826,7 @@ sandbox() {
     ${cow_args[@]+"${cow_args[@]}"} \
     -e HUTCH_PROXY_TOKEN="$proxy_token" -e HUTCH_PROBE_URL="$probe" -e HUTCH_GATE="$url" \
     "$PROJECT_IMAGE" "${run_cmd[@]}" || rc=$?
+  RUNNING_SANDBOX=""
   cleanup_runtime
   trap - EXIT
   [[ -z "$old_trap" ]] || eval "$old_trap"

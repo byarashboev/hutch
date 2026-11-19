@@ -1110,23 +1110,28 @@ STATE="$tmp/rstate"; NAME=rproj; REPO="$CTXR"; PROJECT_IMAGE=hutch-rproj:latest
 MODEL=m SMALL_MODEL=s AGENT=opencode
 for t in ra rb rc; do cmd_new "$t" --allow 'src/*.ts' --brief "$tmp/vbrief" >/dev/null; done
 
+# r_driver runs the code in its last argument in a new bash (the one running these tests) that sources hutch for this block's project,
+# so the commands under test run as in a hutch process, without this script's own EXIT trap.
+cat >"$tmp/r_driver" <<'EOF'
+source "$1/hutch"
+setup_provider
+CONF="$2" STATE="$3" NAME=rproj REPO="$4" PROJECT_IMAGE=hutch-rproj:latest MODEL=m SMALL_MODEL=s AGENT=opencode
+eval "$5"
+EOF
+r_driver=("$BASH" "$tmp/r_driver" "$here" "$CONF" "$STATE" "$REPO")
+
 # N1/N2: Ctrl-C reaches the whole process group of a batch that is throttling (more tasks than --max-parallel). The
 # batch survives its own sleep dying, every started run finishes its cleanup although batch then sends TERM, and
 # nothing of the group is left. The driver runs in its own process group with SIGINT at its default, as at a terminal.
-cat >"$tmp/r_batch_driver" <<'EOF'
-source "$1/hutch"
-setup_provider
-CONF="$2" STATE="$3" NAME=rproj REPO="$4" MODEL=m SMALL_MODEL=s AGENT=opencode HUTCH_WATCHDOG_POLL=0.1
+read -r -d '' r_code <<'EOF'
+HUTCH_WATCHDOG_POLL=0.1
 # Slow like the real docker CLI, so batch's TERM arrives while the runs are still cleaning up.
 docker() { echo "$*" >>"$STATE/docker.log"; sleep 0.3; }
 sandbox() { sh -c 'echo $$ >"$1"; exec sleep 30' _ "$STATE/sleep_$1"; }
-shift 4
-cmd_batch "$@"
+cmd_batch --max-parallel 2 ra rb rc
 EOF
-r_pgrun() {
-  exec python3 -c 'import os, sys, signal; os.setpgrp(); signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])' "$@"
-}
-r_pgrun "$BASH" "$tmp/r_batch_driver" "$here" "$CONF" "$STATE" "$REPO" --max-parallel 2 ra rb rc >"$tmp/r_batch" 2>&1 &
+python3 -c 'import os, sys, signal; os.setpgrp(); signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])' \
+  "${r_driver[@]}" "$r_code" >"$tmp/r_batch" 2>&1 &
 bpid=$!
 sleep 2; kill -INT -- -"$bpid"; wait "$bpid"; rc=$?
 sleep 0.5
@@ -1142,16 +1147,40 @@ check "N1/N2: Ctrl-C to a throttled batch's group stops and cleans up every run,
   ! kill -0 "$(cat "$STATE/sleep_ra")" 2>/dev/null && ! kill -0 "$(cat "$STATE/sleep_rb")" 2>/dev/null'
 
 # N3: an interrupted run records its exit code, so hutch ls shows it and an opencode follow-up (hutch say) can start.
-docker() { return 0; }
 # The second sleep keeps the job from writing its own exit code after its first child is killed.
-sandbox() { sleep 30; sleep 2; }
-(cmd_run ra) >/dev/null 2>&1 &
+"${r_driver[@]}" 'docker() { return 0; }; sandbox() { sleep 30; sleep 2; }; cmd_run ra' >/dev/null 2>&1 &
 bpid=$!
 sleep 1; kill -TERM "$bpid"; wait "$bpid"; rc=$?
 check "N3: an interrupted run writes its exit code" '[[ $rc -eq 143 && "$(cat "$STATE/out/ra/exit.code" 2>/dev/null)" == 143 ]]'
-unset -f docker
 
-unset -f r_pgrun
+# N4: say, shell, smoke and isolation name their sandbox too, and hutch stopped by a signal removes it before the gate
+# and the network (Docker refuses to remove a network a container still uses).
+read -r -d '' r_code <<'EOF'
+docker() {
+  local sub="$1"; shift
+  echo "$sub $*" >>"$STATE/n4.log"
+  case "$sub" in
+    run) [[ " $* " == *" $GATE_IMAGE "* ]] || sleep 10 ;;
+    inspect) echo "172.30.0.4" ;;
+  esac
+  return 0
+}
+need_image() { return 0; }
+HUTCH_API_KEY=sk-n4 SANDBOX_CMD=(true)
+sandbox ra -i
+EOF
+"${r_driver[@]}" "$r_code" >/dev/null 2>&1 &
+bpid=$!
+for _ in $(seq 1 50); do grep -q "^run .*$PROJECT_IMAGE" "$STATE/n4.log" 2>/dev/null && break; sleep 0.1; done
+kill -TERM "$bpid"; wait "$bpid"
+r_ctr="$(awk '$1 == "run" && !/nginx/ { for (i = 1; i < NF; i++) if ($i == "--name") print $(i + 1) }' "$STATE/n4.log")"
+r_ctr_rm="$(grep -nx -- "rm -f $r_ctr" "$STATE/n4.log" | cut -d: -f1)"
+r_gate_rm="$(grep -n -- "^rm -f hutch-gate-" "$STATE/n4.log" | cut -d: -f1)"
+r_net_rm="$(grep -n -- "^network rm " "$STATE/n4.log" | head -1 | cut -d: -f1)"
+check "N4: a sandbox outside hutch run is named and removed before its gate and network when hutch is stopped" '
+  [[ "$r_ctr" == hutch-run-rproj-ra-* && -n "$r_ctr_rm" && -n "$r_gate_rm" && -n "$r_net_rm" &&
+     $r_ctr_rm -lt $r_gate_rm && $r_ctr_rm -lt $r_net_rm ]]'
+
 reload_hutch
 CONF="${r_saved[0]}" STATE="${r_saved[1]}" NAME="${r_saved[2]}" REPO="${r_saved[3]}" PROJECT_IMAGE="${r_saved[4]}"
 
