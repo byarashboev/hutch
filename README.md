@@ -17,8 +17,10 @@ verifies.
 - **Providers:** OpenCode Go (default), the DeepSeek API, or any Anthropic-format API you describe in
   `~/.hutch/providers/<name>.conf` (Claude Code agent). The model is chosen by the kind of work (`HUTCH_KIND`).
 - **Isolation:** the container has no capabilities, sees only its own clone of the repository, and has no route out.
-  Its only peer is a per-run gate that holds the provider key and forwards only the provider's API paths, so the
-  sandbox never holds the key. Results come back as a git bundle; the host never runs git inside the agent's clone.
+  Its only peer is a per-run zero-knowledge gate that authenticates a per-run `HUTCH_PROXY_TOKEN`, strips alternative
+  auth headers, forwards only plain paths (no dot segments, no query string except `?beta=true`), injects the real host key in-flight only for allowed API paths, and logs every call.
+  Dependency/build caches (`cache_overlays`) mount read-only under ephemeral per-run copy-on-write layers so the sandbox
+  runs warm offline without risking host cache poisoning. Results come back as a git bundle.
 - **Any project:** each project describes its toolchain, checks and protected paths in a small config directory.
 
 ## Why
@@ -99,7 +101,7 @@ By hand: `hutch init` (or `hutch init --in-repo`) copies [template/](template/) 
 
 | File | Purpose |
 |---|---|
-| `config` | `base_branch`, `manifests` (dependency files for the image build), `cache_mount`, limits |
+| `config` | `base_branch`, `manifests`, `cache_overlays`, `cache_overlay_mode`, `scope_mode`, `max_turns`, `loop_threshold`, limits |
 | `Dockerfile` | `FROM hutch-base` plus the project's toolchain, caches warmed for offline use |
 | `verify.sh` | the checks `hutch verify` runs offline, per changed area |
 | `protected` | paths the agent may never change |
@@ -115,24 +117,26 @@ computer, for shared repositories). hutch looks in that order.
 
 | Command | |
 |---|---|
-| `hutch status` | machine and project state (exit 3: project not set up, 4: machine not set up) |
+| `hutch status` | machine, cache overlay readiness, and project state (exit 3: project not set up, 4: machine/cache missing) |
 | `hutch init [--in-repo]` | create the project config from the template |
 | `hutch build` | build the images |
-| `hutch new <task> <allow> <brief>` | clone the base branch into a task workspace |
-| `HUTCH_KIND=<kind> hutch run <task>` | run the agent |
+| `hutch new <task> [<allow> <brief>] [options]` | clone base branch; supports `--allow`, `--brief`, `--opened`, `--context path[:start-end]` |
+| `HUTCH_KIND=<kind> hutch run [options] <task>` | run agent with watchdog (`--context`, `--max-turns`, `--max-timeout`, `--loop-threshold`; exit 42/43/44/124) |
+| `hutch batch [options] <task1> <task2>...` | run tasks concurrently (`--max-parallel`, `--max-turns`, `--max-timeout`, `--loop-threshold`) |
 | `hutch say <task> <message>` | follow-up message |
 | `hutch shell <task>` | interactive agent session in the sandbox |
-| `hutch export <task>` / `hutch verify <task>` | bundle the result / check it on the host |
-| `hutch report <task>` | model, tokens, time, commits, verify status and test changes; kept as `report.md` |
+| `hutch export <task>` / `hutch verify [options] <task>` | bundle the result / two-tier check (`--soft-scope`, `--strict-scope`, `--allow-tests`, `--allow`; strict scope is the default) offline |
+| `hutch report <task>` | model, tokens, time, commits, verify status, test changes, unscoped/scope warnings (`report.md`) |
 | `hutch ls` | the project's tasks: age, running or exit code, verify status, commits, model |
 | `hutch rm <task>` | remove the task |
-| `hutch smoke <task>` / `hutch isolation <task>` | model call / isolation probes |
+| `hutch smoke <task>` / `hutch isolation <task>` | model call / isolation, proxy-token, and mount probes |
 | `hutch models` | model per kind, skipped models |
 
 Environment: `HUTCH_KIND`, `HUTCH_MODEL`, `HUTCH_SMALL_MODEL`, `HUTCH_PHASE` (`design`/`build`), `HUTCH_AGENT`,
-`HUTCH_PROVIDER`, `HUTCH_BRANCH`, `HUTCH_OPENED`, `HUTCH_PROJECT` (use a home config from outside the repository),
-`HUTCH_HOME` (default `~/.hutch`), `HUTCH_API_KEY`, `HUTCH_MEMORY`, `HUTCH_PIDS`, `HUTCH_RUNTIME`, `HUTCH_RUN_TIMEOUT`,
-`HUTCH_VERIFY_TIMEOUT`, `HUTCH_EFFORT`, `HUTCH_IDLE_S`.
+`HUTCH_PROVIDER`, `HUTCH_BRANCH`, `HUTCH_OPENED`, `HUTCH_CONTEXT`, `HUTCH_PROJECT` (use a home config from outside the
+repository), `HUTCH_HOME` (default `~/.hutch`), `HUTCH_API_KEY`, `HUTCH_MEMORY`, `HUTCH_PIDS`, `HUTCH_RUNTIME`,
+`HUTCH_RUN_TIMEOUT`, `HUTCH_VERIFY_TIMEOUT`, `HUTCH_MAX_TURNS`, `HUTCH_LOOP_THRESHOLD`, `HUTCH_STRICT_SCOPE`,
+`HUTCH_SOFT_SCOPE`, `HUTCH_ALLOW_TESTS`, `HUTCH_CACHE_OVERLAYS`, `HUTCH_CACHE_OVERLAY_MODE`, `HUTCH_EFFORT`, `HUTCH_IDLE_S`.
 
 ## Agent skill
 

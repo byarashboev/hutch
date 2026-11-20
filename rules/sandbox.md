@@ -13,11 +13,18 @@ whether it is accepted.
 - Run every command in the foreground and wait for it. The run ends when you stop, so a background command would be
   cut off.
 - Change only the paths the brief allows. Never change a path that matches a pattern in `/task/protected.txt` (bash
-  globs; `*` also matches `/`). If `/task/opened.txt` exists, you may change the protected patterns it lists, and only
+  globs; `*` also matches `/`), hard-protected repo files (`.git`, CI configs, manifests/lockfiles, build scripts, `.env*`), or pre-existing tests unless explicitly authorized. If `/task/opened.txt` exists, you may change the protected patterns it lists, and only
   those, following the project's rules for that kind of file (for example, regenerate generated code with its
-  documented command instead of editing it). If the task needs another protected path, stop and say why in your final
-  report.
+  documented command instead of editing it). If the task genuinely needs to edit another file outside scope or a protected path, do not edit it — write the needed repository-relative paths (one per line) to `/work/.hutch-needs-scope` or print `HUTCH_NEEDS_SCOPE: <path1> <path2>` and stop immediately so the reviewer can grant scope.
 - Do not add or upgrade dependencies. Do not weaken, skip or delete existing tests.
+- **Surgical changes:** Touch only what `/task/brief.md` requires. Do not reformat, rename, or clean up adjacent code,
+  comments, or unrelated dead code; remove only imports, variables, or helpers made unused by your own edit. Every
+  changed line must trace directly to the brief.
+- **Simplicity first:** Write the minimum code that satisfies the brief and checklist invariants — no speculative
+  abstractions, unrequested configurability, or single-use wrappers. Keep all checklist invariants and guard checks
+  intact; if sources are ambiguous, follow `/task/checklist.md` E.22 (implement the safest reading and document
+  assumptions under "Open points" / `/out/self-review.md` rather than stalling).
+- **Test-first loop:** For bugs or new behaviour, write a failing test that proves the requirement first, then make it pass.
 - Tests that need services you do not have (databases, browsers, containers, the network) cannot run here. Compile or
   type-check them when the primer says how, and say in your report that they did not run.
 - `/task/checklist.md` is the senior checklist; `/task/project-checklist.md`, when present, adds the project's own

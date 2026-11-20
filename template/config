@@ -4,8 +4,12 @@ base_branch=main
 # ERE of the dependency manifests copied into the image build (from the base branch), so the image can warm its
 # caches. Leave empty when the Dockerfile needs no project files.
 manifests=
-# Container path of a persistent cache volume shared by this project's tasks (for example a build cache). Optional.
-cache_mount=
+# Read-only host dependency/cache overlays mounted with ephemeral per-run CoW upper layers (never mutating the host).
+# Space-separated host_path:container_path pairs (relative host paths resolve from repo root; ~/ expands to $HOME).
+# Example: cache_overlays=node_modules:/work/node_modules ~/.cache/go-build:/cache/go-build
+cache_overlays=
+# Overlay implementation: auto (docker-overlay on Linux with cow-tmpfs fallback; cow-tmpfs on macOS), docker-overlay, cow-tmpfs, ro.
+cache_overlay_mode=auto
 # Sandbox limits, for the agent's run and for hutch verify's checks (they run the agent's code).
 memory=12g
 pids=2048
@@ -17,6 +21,13 @@ runtime=
 # focus markers. tests_policy=report only names them; append-only also fails verify.
 tests=
 tests_policy=report
+# Path scoping mode for hutch verify: strict (default: fail on any file outside allow) or soft (warn with
+# WARN: UNSCOPED_PATHS on non-protected files outside allow). Hard-protected files always fail, pre-existing tests fail
+# unless --allow-tests is passed, and files matching pro-paths fail unless every run of the task used a strong kind.
+scope_mode=strict
 # Wall-clock limits in seconds: a run (and each hutch say follow-up), and the checks of hutch verify.
 run_timeout=3600
 verify_timeout=1800
+# Mid-flight watchdog defaults: max_turns (empty or 0 = unlimited), loop_threshold (consecutive identical failures; 0 disables).
+max_turns=
+loop_threshold=3

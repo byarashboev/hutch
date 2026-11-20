@@ -37,7 +37,7 @@ Once per computer. Ask the user before each step that installs or stores somethi
      as the service name for DeepSeek).
    - Linux: `secret-tool store --label='hutch opencode-go' service opencode-go`.
    - Elsewhere: export `HUTCH_API_KEY` in the shell that runs hutch.
-5. **Images**: `hutch build` builds `hutch-base`, pulls the pinned gate image and creates the two Docker networks
+5. **Images**: `hutch build` builds `hutch-base`, pulls the pinned gate image and creates the egress Docker network (each run gets its own internal network)
    (plus the project image when run inside a project that is set up).
 6. Run `hutch status` again; every machine line must say ok.
 7. **gVisor (optional, Linux).** For a stronger boundary than a container, offer gVisor: install `runsc`
@@ -45,8 +45,11 @@ Once per computer. Ask the user before each step that installs or stores somethi
    in the project config (or `HUTCH_RUNTIME=runsc`). `hutch status` shows a runtime line, and `hutch isolation`
    reports the sandbox's kernel, which under gVisor differs from the host's. Docker Desktop on macOS does not ship it.
 
-The sandbox has no route out; its only peer is a gate started for each sandbox command. The gate holds the key and
-forwards only the provider's `paths=` to its `upstream`. Do not widen a provider's paths or point it at another host
+The sandbox has no route out; its only peer is a gate started for each sandbox command. The gate holds the real key in
+its own environment, validates a unique per-run `HUTCH_PROXY_TOKEN` sent by the sandbox (exact match, case-sensitive), strips any alternative
+credential headers, refuses anything but plain paths (`[A-Za-z0-9._~/-]`, no dot segments, no query string except `?beta=true`), and forwards only the provider's `paths=` to
+its `upstream` while overwriting `Authorization` / `x-api-key` in flight. The sandbox never holds the real key and cannot
+authenticate to another account on the upstream provider. Do not widen a provider's paths or point it at another host
 to make a task easier: package registries and Git hosts stay closed on purpose.
 
 ## Project setup
@@ -87,8 +90,12 @@ Ask these questions together, each with your drafted answer and the reason for i
 
 1. `hutch init` (home config) or `hutch init --in-repo`. It copies `template/` and records the name and repository.
 2. Fill in every file:
-   - `config`: `base_branch`, `manifests` (an ERE over repository paths), `cache_mount` if the toolchain has a
-     build cache worth keeping between tasks, `runtime` if gVisor is installed.
+   - `config`: `base_branch`, `manifests` (an ERE over repository paths), `cache_overlays` (read-only host
+     dependency/cache directories mounted with ephemeral CoW upper layers, e.g. `node_modules:/work/node_modules`) and
+     `cache_overlay_mode` (`auto`, `docker-overlay`, `cow-tmpfs`, `ro`; `cow-tmpfs` copies the cache into RAM at every
+     start, counted against `memory=`, so exceeding it kills the container with exit 137; `auto` probes the overlay volume
+     and falls back to `cow-tmpfs`), `scope_mode` (`strict`, the default, or `soft`), `max_turns` and
+     `loop_threshold` watchdog defaults, and `runtime` if gVisor is installed.
    - `Dockerfile`: the toolchain, pinned; warm the caches from `src/` (the manifests); end offline and as `USER hutch`.
    - `verify.sh`: the checks per changed area. Every command must work with no network. It must fail on a failing
      check.
@@ -114,32 +121,76 @@ Ask these questions together, each with your drafted answer and the reason for i
 
 ## Working with hutch
 
-### One task
+### When NOT to delegate vs. when to delegate
 
-1. **Brief** (`brief.md`): the goal, the exact files to change and why, the behaviour and tests required, the checks to
+- **Do NOT use hutch** for small edits (<50 lines across 1–2 files) where the relevant files are already loaded in your
+  context — edit them directly so orchestration latency does not exceed direct edit time.
+- **DO use hutch** for well-bounded mechanical tasks, isolated test generation, multi-file refactors with clear specs,
+  or **parallel fan-out** across independent modules (`hutch batch`).
+
+### One task and parallel fan-out
+
+1. **Brief** (`brief.md`): **think before coding** — surface ambiguous requirements or design tradeoffs to the user upfront
+   (or run `HUTCH_PHASE=design` first) so the headless sandbox receives an unambiguous brief and never guesses or stalls.
+   Then write `brief.md`: the goal, the exact files to change and why, the behaviour and tests required, the checks to
    run, the steps to commit separately, and what is out of scope. Name the sources the agent must read (file paths). A
    short, precise brief beats a long one.
-2. **Allow file**: the paths the task may change, bash globs, one per line. Keep it narrow.
+2. **Allow file / globs**: the paths the task may change, bash globs, one per line (or `--allow <glob>`). Keep it narrow.
 3. **Opened file** (optional): protected patterns from `openable` this task may change, one per line, passed as
-   `HUTCH_OPENED=<file> hutch new ...`. Repeat them in the brief.
-4. `hutch new <task> <allow> <brief>`.
-5. **Choose the model by the kind of work**: `HUTCH_KIND=<kind> hutch run <task>` (`hutch models` shows the table).
-   Tasks that touch `pro-paths` or open protected paths are refused unless the kind is a strong one (`design` or
-   `concurrency`). A mixed task can run `HUTCH_PHASE=design` on a strong model first (it writes
-   `/out/design-notes.md`), then `HUTCH_PHASE=build` with a cheaper kind; add a "Reviewer notes" section to the
-   design notes to correct them before the build.
-6. After the run: `exit.code` must be 0 (124 means the run hit `run_timeout`) and `run.err` empty (both in the task's
-   out directory, `~/.hutch/state/<name>/out/<task>/`). Read `self-review.md` and the end of `run.jsonl`.
-7. Follow-ups: `hutch say <task> "<message>"` (opencode: after the run ends; Claude Code: during it).
-8. `hutch export <task>`, then `hutch verify <task>`: it checks that every changed path is allowed and not protected,
-   lists added comment lines, names changes to existing tests (deleted files, removed lines, skip markers), and runs
-   `verify.sh` offline. Treat every named test change as a finding to check in the diff.
-9. `hutch report <task>` gives the model, usage, commits, verify status and test changes in one page (`report.md`);
-   start the review from it.
-10. **Review the diff yourself** (`git -C <repo> diff <base> refs/hutch/<task>`). `verify` passing is not acceptance.
-11. Take the work: create your branch from `refs/hutch/<task>` (or cherry-pick its commits) in the project, then
+   `HUTCH_OPENED=<file> hutch new ...` or `--opened <file>`. Repeat them in the brief.
+4. **Pre-pack context**: pass `--context <path>[:start[-end]]` on `hutch new` or `hutch run` (for example
+   `--context src/types.ts:1-60`) to inline numbered snippets into `/task/context.md` and the initial prompt so the inner
+   agent starts coding immediately without exploratory discovery turns.
+5. `hutch new <task> <allow> <brief> [--context <spec>...]`.
+6. **Choose the model by the kind of work & run with watchdog**:
+   `HUTCH_KIND=<kind> hutch run [--max-turns <N>] [--max-timeout <S>] [--loop-threshold <N>] [--context <spec>...] <task>`
+   (`hutch models` shows the table). Tasks that touch `pro-paths` or open protected paths are refused unless the kind is
+   a strong one (`design` or `concurrency`). A mixed task can run `HUTCH_PHASE=design` on a strong model first (it writes
+   `/out/design-notes.md`, i.e. `out/<task>/sandbox/design-notes.md` on the host), then `HUTCH_PHASE=build` with a cheaper kind; add a "Reviewer notes" section to the design
+   notes to correct them before the build. The sandbox writes that directory, so before editing a file there check that
+   it is a regular file, not a symlink (`test -f <file> && test ! -L <file>`).
+7. **Parallel fan-out**: run independent tasks concurrently with
+   `hutch batch [--max-parallel <N>] [--max-turns <N>] [--max-timeout <S>] [--loop-threshold <N>] <task1> <task2> ...`
+   (or concurrent `hutch run` invocations). Every run gets unique gate names, proxy tokens, CoW overlays, and per-task
+   agent state directories (`oc-data` / `claude-data`), and its own internal network shared only by its sandbox and gate.
+   Docker's default address pools allow roughly 30 bridge networks, so a very large fan-out can hit that limit (`hutch build`
+   and every run remove the unused networks a killed run left behind). On Ctrl-C or
+   TERM, `batch` stops all runs and still prints its summary (outcomes `interrupted` and `not started`; exit 130/143);
+   it rejects a task named twice.
+8. After the run, check the exit code and `run.err` (in `~/.hutch/state/<name>/out/<task>/`):
+   - `0`: completed normally; read `sandbox/self-review.md` (the sandbox's `/out`) and the end of `run.jsonl`. Ctrl-C on `hutch run` stops the sandbox
+     and gate (exit 130/143).
+   - `42` (`EARLY_ABORT: NEEDS_SCOPE`): the sandbox wrote `.hutch-needs-scope` or printed `HUTCH_NEEDS_SCOPE:` in its own
+     text (tool output does not count); read `needs-scope.txt`, add the paths to the task's allow file
+     (`~/.hutch/state/<name>/work/<task>/allow`, or handle directly), and re-run (`hutch run` has no `--allow`; stale markers
+     are removed at the start of each run).
+   - `43` (`EARLY_ABORT: LOOP_DETECTED`): watchdog stopped the same command failing with the same error `--loop-threshold` times in a row (empty or generic errors don't count); read `abort.log`.
+   - `44` (`EARLY_ABORT: MAX_TURNS`): watchdog stopped the run when turns exceeded `--max-turns`; inspect `abort.log`.
+   - `124`: hit `run_timeout` / `--max-timeout` (`0` means no limit).
+9. Follow-ups: `hutch say <task> "<message>"` (opencode: after the run ends; Claude Code: during it).
+10. `hutch export <task>`, then `hutch verify [options] <task>`:
+    - **Tier 1 — Hard Denylist (always rejected):** `.hutch/*`, `.git/*`, CI configs, manifests/lockfiles at any depth (`package.json`,
+      `go.mod`, `composer.json`, `Gemfile`, `pyproject.toml`, `setup.py`, `pom.xml`, `build.gradle*`, etc.), package-manager,
+      git-hook and test-runner configs (`.npmrc`, `.yarnrc*`, `.husky/*`, `.pre-commit-config.yaml`, `pytest.ini`, `tox.ini`,
+      `jest.config.*`, `vitest.config.*`, `phpunit.xml*`, `conftest.py`),
+      build scripts (`Makefile`/`makefile`, `Dockerfile`, compose files), `.env*`, `.gitattributes`,
+      project `protected` patterns (unless `openable` and opened), and **pre-existing test files** (unless `--allow-tests`; `Tests/` directories and `*Test.php` count as tests).
+      Renames count as a delete plus an add.
+      New test files added by the agent are permitted without `--allow-tests`.
+    - **Tier 2 — Explicit Allowlist (`--allow`):** `ok`.
+    - **Tier 3 — Strict Scope (default, or `--strict-scope`):** any edit outside `--allow` fails verification; pass
+      `--allow <glob>` to promote a path. With `--soft-scope` (or `scope_mode=soft`), non-protected source edits outside
+      `--allow` pass with a **`WARN: UNSCOPED_PATHS`** section and diff stat (saved to `unscoped.txt`) for senior review.
+    - Files matching `pro-paths` fail verification unless every run of the task used a strong kind (`design`/`concurrency`;
+      decided when each run, follow-up or shell starts and recorded in `work/<task>/run-models`, so a later change of
+      provider or model table does not change it; a task with no record fails closed).
+    - Lists added comment lines, names changes to existing tests, and runs `verify.sh` offline with read-only base overlays.
+11. `hutch report <task>` gives the model, usage, commits, verify status, test changes, `WARN: UNSCOPED_PATHS`, and
+    requested scope escalations in one page (`report.md`); start the review from it.
+12. **Review the diff yourself** (`git -C <repo> diff <base> refs/hutch/<task>`). `verify` passing is not acceptance.
+13. Take the work: create your branch from `refs/hutch/<task>` (or cherry-pick its commits) in the project, then
     continue with the project's normal process (tests that need services, review, pull request).
-12. `hutch rm <task>` when it is merged or abandoned. `hutch ls` lists the project's tasks with their state, so
+14. `hutch rm <task>` when it is merged or abandoned. `hutch ls` lists the project's tasks with their state, so
     nothing is left behind.
 
 ### Verification rules
